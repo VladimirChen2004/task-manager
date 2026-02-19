@@ -27,24 +27,27 @@ NOTION_DATA_SOURCE_ID = "3050c57f-d841-81b5-98c6-000bda09220f"
 
 # --- Status mappings ---
 NOTION_TO_JIRA_STATUS: Dict[str, str] = {
-    "Not started": "To Do",
-    "Idea": "Backlog",
-    "In progress": "In Progress",
-    "Hold": "On Hold",
+    "Not started": "New",
+    "Idea": "Idea",
+    "In progress": "В работе",
+    "Hold": "Hold",
     "Done": "Done",
 }
 
 JIRA_TO_NOTION_STATUS: Dict[str, str] = {
-    v: k for k, v in NOTION_TO_JIRA_STATUS.items()
+    "New": "Not started",
+    "Idea": "Idea",
+    "В работе": "In progress",
+    "Hold": "Hold",
+    "Done": "Done",
 }
 
 # --- Priority mappings ---
 NOTION_TO_JIRA_PRIORITY: Dict[str, str] = {
-    "Наивысшая срочность": "Highest",
-    "Срочно": "High",
-    "Средняя срочность": "Medium",
-    "Не срочно": "Low",
-    "Бессрочно": "Lowest",
+    "Now": "Highest",
+    "High": "High",
+    "Medium": "Medium",
+    "Low": "Low",
 }
 
 # --- Progress emoji ---
@@ -70,14 +73,14 @@ def get_progress_emoji(percentage: float) -> str:
 class JiraConfig:
     server: str = field(
         default_factory=lambda: os.environ.get(
-            "JIRA_VCHEN_URL", "https://vchen.atlassian.net"
+            "JIRA_URL", "https://nfware.atlassian.net"
         )
     )
     email: str = field(
-        default_factory=lambda: os.environ.get("JIRA_VCHEN_EMAIL", "")
+        default_factory=lambda: os.environ.get("JIRA_EMAIL", "")
     )
     api_token: str = field(
-        default_factory=lambda: os.environ.get("JIRA_VCHEN_API_TOKEN", "")
+        default_factory=lambda: os.environ.get("JIRA_API_TOKEN", "")
     )
 
 

@@ -13,15 +13,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Автоматизация управления задачами: связка **Notion** <-> **Jira** <-> **Confluence**.
 
 Пользователь ведёт задачи в Notion (доска "Tasks 2026"). Этот проект обеспечивает:
-1. При создании задачи через `/notion-task` — автоматическое создание issue в Jira VCHEN
+1. При создании задачи через `/notion-task` — автоматическое создание issue в Jira VC (nfware.atlassian.net)
 2. Jira Automation (настроено в UI) — автоматическое создание Confluence-страницы с ТЗ при создании issue
-3. Cron-скрипт — двусторонняя синхронизация статусов Jira ↔ Notion + прогресс подзадач
+3. Sync-скрипт — двусторонняя синхронизация статусов Jira ↔ Notion + прогресс подзадач
 
 ### Архитектура потока данных
 
 ```
 Пользователь → /notion-task (Claude Code skill)
-    ├── 1. Создаёт issue в Jira VCHEN (jira_vchen.py create)
+    ├── 1. Создаёт issue в Jira VC (jira_vchen.py create)
     ├── 2. Создаёт подзадачи в Jira (jira_vchen.py create-subtasks) — опционально
     ├── 3. Создаёт страницу в Notion (MCP: notion-create-pages) с Jira Key
     └── Jira Automation (no-code, настроено в Jira UI)
@@ -31,7 +31,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     ├── Обновляет Status в Notion
     └── Шаг 3.5: transition_issue() → обновляет статус в Jira
 
-Cron (каждые 10 мин):
+Cron (каждые 10 мин, на сервере в tmux):
     jira_notion_sync.py --bidirectional --with-progress
     ├── Jira → Notion: статусы + прогресс подзадач в контент страницы
     └── Notion → Jira: обнаружение ручных изменений статуса в Notion UI
@@ -44,7 +44,7 @@ Cron (каждые 10 мин):
 ```
 taskautomation/           # Python-пакет
 ├── config.py             # env, маппинги, константы (единственное место)
-├── jira_client.py        # класс JiraVCHEN
+├── jira_client.py        # класс JiraVCHEN (проект VC, REST API v3)
 ├── notion_client.py      # класс NotionClient (REST API + Block API)
 ├── sync.py               # JiraToNotionSync, NotionToJiraSync, ProgressSync
 └── cli.py                # единый CLI (main_jira, main_sync)
@@ -80,16 +80,16 @@ SYNC=/Users/nfware/Documents/my_prjcts/task-automation/jira_notion_sync.py
 
 ```bash
 $PYTHON $SCRIPT create --title "Название" --description "Описание" --priority Medium --labels "development"
-$PYTHON $SCRIPT create-subtasks VCHEN-42 --subtasks '[{"title":"подзадача 1"}]'
-$PYTHON $SCRIPT get VCHEN-42
+$PYTHON $SCRIPT create-subtasks VC-42 --subtasks '[{"title":"подзадача 1"}]'
+$PYTHON $SCRIPT get VC-42
 $PYTHON $SCRIPT list-active
 $PYTHON $SCRIPT recently-updated --minutes 30
 $PYTHON $SCRIPT discover-statuses
 $PYTHON $SCRIPT discover-issue-types
 
 # Transitions (для бидирекционального sync)
-$PYTHON $SCRIPT transition VCHEN-42 --status "In Progress"
-$PYTHON $SCRIPT transitions VCHEN-42    # показать доступные переходы
+$PYTHON $SCRIPT transition VC-42 --status "В работе"
+$PYTHON $SCRIPT transitions VC-42    # показать доступные переходы
 ```
 
 ### Sync (jira_notion_sync.py)
@@ -120,37 +120,36 @@ make test          # pytest
 
 ---
 
-## Jira VCHEN
+## Jira VC (nfware.atlassian.net)
 
-- **URL:** `https://vchen.atlassian.net`
-- **Проект:** `VCHEN`
-- **Это ОТДЕЛЬНЫЙ инстанс** от nfware.atlassian.net (DOCS проект в doc-automation — другая история). НЕ СМЕШИВАТЬ.
-- **API:** python-jira library, basic auth (email + API token)
+- **URL:** `https://nfware.atlassian.net`
+- **Проект:** `VC`
+- **Board:** `https://nfware.atlassian.net/jira/core/projects/VC/board`
+- **API:** REST API v3 (direct requests) + python-jira (для transitions/statuses). Гибридный подход т.к. nfware.atlassian.net deprecated `/rest/api/3/search` — используем `/rest/api/3/search/jql`.
+- **Issue types:** Задача, Подзадача (русские названия)
+- **Описания:** Atlassian Document Format (ADF), не plain text
 
 ### Маппинг статусов
 
 | Notion Status | Jira Status |
 |---|---|
-| Not started | To Do |
-| Idea | Backlog |
-| In progress | In Progress |
-| Hold | On Hold |
+| Not started | New |
+| Idea | Idea |
+| In progress | В работе |
+| Hold | Hold |
 | Done | Done |
 | Archived | (нет маппинга) |
 
 Маппинги определены в `taskautomation/config.py`: `NOTION_TO_JIRA_STATUS`, `JIRA_TO_NOTION_STATUS`.
 
-**ВАЖНО:** После заполнения credentials запустить `discover-statuses` и при необходимости скорректировать словари в `config.py`.
-
 ### Маппинг приоритетов
 
 | Notion (Priority property) | Jira Priority |
 |---|---|
-| Наивысшая срочность | Highest |
-| Срочно | High |
-| Средняя срочность (default) | Medium |
-| Не срочно | Low |
-| Бессрочно | Lowest |
+| Now | Highest |
+| High | High |
+| Medium (default) | Medium |
+| Low | Low |
 
 ### Разрешение конфликтов (bidirectional sync)
 
@@ -177,8 +176,8 @@ make test          # pytest
 | Задача | text | Внутренний идентификатор |
 | Приоритетность | select | Срочно |
 | Приоритетность (1) | select | тест, Корп культура, Обучение, Онбординг, Процессы, Развитие, Рекрутинг |
-| Jira Key | text | VCHEN-XX (заполняется автоматически) |
-| Priority | select | Наивысшая срочность, Срочно, Средняя срочность, Не срочно, Бессрочно |
+| Jira Key | text | VC-XX (заполняется автоматически) |
+| Priority | select | Now, High, Medium, Low |
 
 ---
 
@@ -192,20 +191,25 @@ make test          # pytest
 
 ## Деплой
 
-Сервер: Ubuntu (Nvidia Spark GX10), cron каждые 10 мин.
+Сервер: `vchen@10.20.40.232` (Ubuntu 24.04, ARM64, NVIDIA DGX Spark).
+
+Проект живёт в `/home/vchen/automations/task-automation/`. Sync запускается в tmux-сессии `task-sync` (цикл каждые 10 мин). Автозапуск при перезагрузке через `@reboot` crontab → `~/automations/start-all.sh`.
 
 ```bash
 make deploy                    # rsync на сервер
-# Далее на сервере:
-nano /home/nfware/task-automation/.env    # заполнить credentials
-crontab -e                     # добавить из deploy/crontab.example
+# Управление на сервере:
+ssh vchen@10.20.40.232
+~/automations/start-all.sh     # запустить все автоматизации
+~/automations/stop-all.sh      # остановить все
+tmux attach -t task-sync       # подключиться к sync-сессии
 ```
 
 ---
 
-## Confluence (автоматическое ТЗ)
+## Confluence
 
-Настраивается в Jira UI (не код): Jira VCHEN → Project Settings → Automation → Create rule. Подробный шаблон — в `SETUP.md` шаг 4.
+- **Folder:** `https://nfware.atlassian.net/wiki/spaces/~7120207d46508b6f30445a8f04596b39efdffc/folder/4349460483`
+- Настраивается в Jira UI: VC → Project Settings → Automation → Create rule. Подробный шаблон — в `SETUP.md`.
 
 ---
 
@@ -218,7 +222,7 @@ crontab -e                     # добавить из deploy/crontab.example
 
 ## Контекст: другие проекты
 
-- **`/Users/nfware/Documents/doc-automation/`** — pipeline документации (Confluence → RST → Sphinx). Другой Jira (nfware.atlassian.net, проект DOCS). НЕ СМЕШИВАТЬ.
+- **`/Users/nfware/Documents/doc-automation/`** — pipeline документации (Confluence → RST → Sphinx). Тот же Jira (nfware.atlassian.net), но проект DOCS. НЕ СМЕШИВАТЬ.
 - **`/Users/nfware/Documents/my_prjcts/server-monitor-bot/`** — Telegram-бот мониторинга серверов
 - **`/Users/nfware/Documents/my_prjcts/money_analitics/`** — аналитика финансов
 

@@ -3,9 +3,9 @@
 set -euo pipefail
 
 # --- Configuration ---
-REMOTE_USER="${REMOTE_USER:-nfware}"
-REMOTE_HOST="${REMOTE_HOST:-spark}"
-REMOTE_DIR="${REMOTE_DIR:-/home/nfware/task-automation}"
+REMOTE_USER="${REMOTE_USER:-vchen}"
+REMOTE_HOST="${REMOTE_HOST:-10.20.40.232}"
+REMOTE_DIR="${REMOTE_DIR:-/home/vchen/automations/task-automation}"
 LOCAL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 echo "=== Deploying task-automation to ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR} ==="
