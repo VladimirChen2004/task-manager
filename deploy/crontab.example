@@ -1,0 +1,9 @@
+# Task automation: Jira ↔ Notion sync
+# Install: crontab -e, then paste the line(s) below
+
+# Jira → Notion status sync (every 10 min)
+*/10 * * * * /home/nfware/task-automation/deploy/sync_wrapper.sh >> /var/log/task-automation-sync.log 2>&1
+
+# Bidirectional sync with progress (every 10 min)
+# Uncomment when ready:
+# */10 * * * * /home/nfware/task-automation/deploy/sync_wrapper.sh --bidirectional --with-progress >> /var/log/task-automation-sync.log 2>&1
