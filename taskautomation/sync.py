@@ -494,12 +494,9 @@ class NotionToJiraSync:
         """Detect pages deleted from Notion and archive their Jira issues.
 
         Uses a grace period: a key must be missing for 2 consecutive cycles
-        before archiving, to avoid false positives from API/pagination errors.
+        before deleting, to avoid false positives from API/pagination errors.
         """
         missing = self._state.get("missing_keys", {})
-        archive_target = NOTION_TO_JIRA_STATUS.get("Archived")
-        if not archive_target:
-            return
 
         # Find keys that were known but are now missing
         for jira_key in list(self._known.keys()):
@@ -519,34 +516,26 @@ class NotionToJiraSync:
                 )
                 continue
 
-            # Missing for 2+ cycles — archive in Jira
-            known_entry = self._known.get(jira_key)
-            known_notion = known_entry.get("notion") if isinstance(known_entry, dict) else known_entry
-            if known_notion == "Archived":
-                # Already archived, just clean up
-                missing.pop(jira_key, None)
-                continue
-
+            # Missing for 2+ cycles — delete from Jira entirely
             if self.dry_run:
                 log.info(
-                    "[DRY-RUN] %s: would archive (page deleted from Notion)",
+                    "[DRY-RUN] %s: would delete from Jira (page deleted from Notion)",
                     jira_key,
                 )
             else:
-                success = self.jira.transition_issue(jira_key, archive_target)
+                success = self.jira.delete_issue(jira_key)
                 if success:
                     log.info(
-                        "%s: archived in Jira (page deleted from Notion)",
+                        "%s: deleted from Jira (page deleted from Notion)",
                         jira_key,
                     )
-                    self._known[jira_key] = {"notion": "Archived", "jira": "Archived"}
                     self.stats["updated"] += 1
                 else:
-                    log.warning(
-                        "%s: failed to archive in Jira", jira_key
-                    )
+                    log.warning("%s: failed to delete from Jira", jira_key)
                     self.stats["errors"] += 1
 
+            # Clean up from known state
+            self._known.pop(jira_key, None)
             missing.pop(jira_key, None)
 
         self._state["missing_keys"] = missing
