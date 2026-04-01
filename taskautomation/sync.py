@@ -389,9 +389,11 @@ class BidirectionalSync:
     def _save(self):
         if self.dry_run:
             return  # Don't persist state from dry-run — mutations weren't applied
-        self._state["known_notion_statuses"] = self._known
-        self._state["known_notion_priorities"] = self._known_priorities
-        _save_state(self._state)
+        # Read-modify-write to avoid clobbering other phases' state
+        state = _load_state()
+        state["known_notion_statuses"] = self._known
+        state["known_notion_priorities"] = self._known_priorities
+        _save_state(state)
 
     def _log_stats(self):
         s = self.stats
@@ -547,9 +549,13 @@ class NotionToJiraSync:
         self._state["missing_keys"] = missing
 
     def _save(self):
-        self._state["last_notion_to_jira_sync"] = datetime.now().isoformat()
-        self._state["known_notion_statuses"] = self._known
-        _save_state(self._state)
+        # Read-modify-write to avoid clobbering other phases' state
+        state = _load_state()
+        state["last_notion_to_jira_sync"] = datetime.now().isoformat()
+        state["known_notion_statuses"] = self._known
+        state["missing_keys"] = self._state.get("missing_keys", {})
+        state["template_backfilled"] = self._state.get("template_backfilled", [])
+        _save_state(state)
 
     def _log_stats(self):
         s = self.stats
