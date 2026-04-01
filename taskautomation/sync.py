@@ -463,6 +463,9 @@ class NotionToJiraSync:
         # Detect deleted pages and archive their Jira issues
         self._handle_deleted_pages(current_keys)
 
+        self._save()
+        self._log_stats()
+
     def _backfill_templates(self, pages: List[Dict[str, Any]]):
         """Add missing template sections to existing pages (one-time catch-up)."""
         backfilled = self._state.get("template_backfilled", set())
