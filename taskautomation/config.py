@@ -27,19 +27,21 @@ NOTION_DATA_SOURCE_ID = "3050c57f-d841-81b5-98c6-000bda09220f"
 
 # --- Status mappings ---
 NOTION_TO_JIRA_STATUS: Dict[str, str] = {
-    "Not started": "New",
+    "Not started": "Новое",
     "Idea": "Idea",
     "In progress": "В работе",
     "Hold": "Hold",
-    "Done": "Done",
+    "Done": "Готово",
+    "Archived": "Archieve",
 }
 
 JIRA_TO_NOTION_STATUS: Dict[str, str] = {
-    "New": "Not started",
+    "Новое": "Not started",
     "Idea": "Idea",
     "В работе": "In progress",
     "Hold": "Hold",
-    "Done": "Done",
+    "Готово": "Done",
+    "Archieve": "Archived",
 }
 
 # --- Priority mappings ---
@@ -49,6 +51,29 @@ NOTION_TO_JIRA_PRIORITY: Dict[str, str] = {
     "Medium": "Medium",
     "Low": "Low",
 }
+
+JIRA_TO_NOTION_PRIORITY: Dict[str, str] = {
+    "Highest": "Now",
+    "High": "High",
+    "Medium": "Medium",
+    "Low": "Low",
+    "Lowest": "Low",
+}
+
+# --- Daemon settings ---
+DAEMON_INTERVAL_SECONDS = int(os.environ.get("SYNC_INTERVAL", "60"))
+
+# --- Subtask project ---
+# When set, subtasks are created as regular tasks in this project
+# with a label linking back to the parent. Set via SUBTASK_PROJECT env var.
+SUBTASK_PROJECT = os.environ.get("SUBTASK_PROJECT", "")
+
+# --- Default subtasks (plan items for new Jira issues) ---
+DEFAULT_SUBTASKS = [
+    {"title": "Анализ и проектирование"},
+    {"title": "Реализация"},
+    {"title": "Тестирование и проверка"},
+]
 
 # --- Progress emoji ---
 
@@ -90,3 +115,29 @@ class NotionConfig:
         default_factory=lambda: os.environ.get("NOTION_API_TOKEN", "")
     )
     database_id: str = field(default_factory=lambda: NOTION_DATABASE_ID)
+
+
+@dataclass
+class ConfluenceConfig:
+    base_url: str = field(
+        default_factory=lambda: os.environ.get(
+            "CONFLUENCE_BASE_URL",
+            os.environ.get("JIRA_URL", "https://nfware.atlassian.net") + "/wiki",
+        )
+    )
+    space_key: str = field(
+        default_factory=lambda: os.environ.get(
+            "CONFLUENCE_SPACE_KEY", "~7120207d46508b6f30445a8f04596b39efdffc"
+        )
+    )
+    parent_page_id: str = field(
+        default_factory=lambda: os.environ.get(
+            "CONFLUENCE_PARENT_PAGE_ID", "4349132807"
+        )
+    )
+    email: str = field(
+        default_factory=lambda: os.environ.get("JIRA_EMAIL", "")
+    )
+    api_token: str = field(
+        default_factory=lambda: os.environ.get("JIRA_API_TOKEN", "")
+    )

@@ -31,6 +31,26 @@ class NotionClient:
             "Content-Type": "application/json",
         }
 
+    # ---- HTTP helper with rate-limit retry ----
+
+    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+        """HTTP request with retry on 429 (Notion rate limit)."""
+        kwargs.setdefault("timeout", 30)
+        for attempt in range(3):
+            resp = getattr(requests, method)(
+                url, headers=self.headers, **kwargs
+            )
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", 1))
+                log.warning(
+                    "Rate limited, retry in %ds (attempt %d/3)",
+                    retry_after, attempt + 1,
+                )
+                time.sleep(retry_after)
+                continue
+            return resp
+        return resp
+
     # ---- Page Queries ----
 
     def find_page_by_jira_key(self, jira_key: str) -> Optional[Dict[str, Any]]:
@@ -96,14 +116,73 @@ class NotionClient:
             return rich_text[0].get("plain_text", "").strip()
         return None
 
+    @staticmethod
+    def get_page_title(page: Dict[str, Any]) -> Optional[str]:
+        """Extract Task name (title) from page properties."""
+        title_prop = page.get("properties", {}).get("Task name", {})
+        title_arr = title_prop.get("title", [])
+        if title_arr:
+            return "".join(t.get("plain_text", "") for t in title_arr).strip()
+        return None
+
+    @staticmethod
+    def get_page_summary(page: Dict[str, Any]) -> Optional[str]:
+        """Extract Summary from page properties."""
+        prop = page.get("properties", {}).get("Summary", {})
+        rt = prop.get("rich_text", [])
+        if rt:
+            return "".join(t.get("plain_text", "") for t in rt).strip()
+        return None
+
+    @staticmethod
+    def get_page_priority(page: Dict[str, Any]) -> Optional[str]:
+        """Extract Priority from page properties."""
+        prop = page.get("properties", {}).get("Priority", {})
+        sel = prop.get("select")
+        if sel:
+            return sel.get("name")
+        return None
+
+    def query_pages_without_jira_key(self) -> List[Dict[str, Any]]:
+        """Get all pages that have empty Jira Key (new tasks needing Jira issue)."""
+        url = f"{self.API_URL}/databases/{self.database_id}/query"
+        all_pages = []
+        has_more = True
+        start_cursor = None
+
+        while has_more:
+            payload = {
+                "filter": {
+                    "property": "Jira Key",
+                    "rich_text": {"is_empty": True},
+                },
+                "page_size": 100,
+            }
+            if start_cursor:
+                payload["start_cursor"] = start_cursor
+
+            resp = self._request("post", url, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            all_pages.extend(data.get("results", []))
+            has_more = data.get("has_more", False)
+            start_cursor = data.get("next_cursor")
+            time.sleep(0.4)
+
+        return all_pages
+
     # ---- Page Property Updates ----
 
     def update_page_status(self, page_id: str, status_name: str) -> bool:
         """Update the Status property of a Notion page."""
+        return self.update_page_properties(
+            page_id, {"Status": {"status": {"name": status_name}}}
+        )
+
+    def update_page_properties(self, page_id: str, properties: Dict[str, Any]) -> bool:
+        """Update arbitrary properties of a Notion page."""
         url = f"{self.API_URL}/pages/{page_id}"
-        payload = {
-            "properties": {"Status": {"status": {"name": status_name}}}
-        }
+        payload = {"properties": properties}
 
         resp = requests.patch(
             url, headers=self.headers, json=payload, timeout=30
@@ -117,6 +196,76 @@ class NotionClient:
             resp.text,
         )
         return False
+
+    def update_page_jira_key(self, page_id: str, jira_key: str) -> bool:
+        """Set the 'Jira Key' property on a Notion page."""
+        url = f"{self.API_URL}/pages/{page_id}"
+        payload = {
+            "properties": {
+                "Jira Key": {
+                    "rich_text": [
+                        {"type": "text", "text": {"content": jira_key}}
+                    ]
+                }
+            }
+        }
+        resp = self._request("patch", url, json=payload)
+        if resp.status_code == 200:
+            return True
+        log.error(
+            "Failed to update Jira Key on %s: %s %s",
+            page_id, resp.status_code, resp.text,
+        )
+        return False
+
+    def create_page(
+        self,
+        title: str,
+        status: str = "Not started",
+        summary: str = "",
+        jira_key: str = "",
+        priority: str = "",
+        jira_url: str = "",
+        children: Optional[List[Dict]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Create a new page in the Tasks database."""
+        url = f"{self.API_URL}/pages"
+        properties: Dict[str, Any] = {
+            "Task name": {
+                "title": [{"type": "text", "text": {"content": title}}]
+            },
+            "Status": {"status": {"name": status}},
+        }
+        if summary:
+            properties["Summary"] = {
+                "rich_text": [
+                    {"type": "text", "text": {"content": summary[:2000]}}
+                ]
+            }
+        if jira_key:
+            properties["Jira Key"] = {
+                "rich_text": [
+                    {"type": "text", "text": {"content": jira_key}}
+                ]
+            }
+        if priority:
+            properties["Priority"] = {"select": {"name": priority}}
+
+        payload: Dict[str, Any] = {
+            "parent": {"database_id": self.database_id},
+            "properties": properties,
+        }
+        if children:
+            payload["children"] = children
+
+        resp = self._request("post", url, json=payload)
+        if resp.status_code == 200:
+            return resp.json()
+        log.error(
+            "Failed to create page '%s': %s %s",
+            title, resp.status_code, resp.text,
+        )
+        return None
 
     # ---- Block API (for progress sync) ----
 
@@ -271,3 +420,258 @@ class NotionClient:
         url = f"{self.API_URL}/blocks/{block_id}"
         resp = requests.delete(url, headers=self.headers, timeout=30)
         return resp.status_code == 200
+
+    # ---- Section content API ----
+
+    def get_toggle_content(
+        self, page_id: str, heading_text: str,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Get child blocks of a toggle heading (recursively fetching nested children).
+
+        Returns list of raw Notion blocks, or None if toggle not found.
+        """
+        toggle_id = self.find_toggle_by_text(page_id, heading_text)
+        if not toggle_id:
+            return None
+        children = self.get_block_children(toggle_id)
+        # Recursively fetch nested children and attach as _children
+        for child in children:
+            if child.get("has_children"):
+                child["_children"] = self._fetch_children_recursive(child["id"])
+        return children
+
+    def _fetch_children_recursive(
+        self, block_id: str, depth: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Recursively fetch children up to depth 3."""
+        if depth > 3:
+            return []
+        children = self.get_block_children(block_id)
+        for child in children:
+            if child.get("has_children"):
+                child["_children"] = self._fetch_children_recursive(
+                    child["id"], depth + 1
+                )
+        return children
+
+    def replace_toggle_content(
+        self, page_id: str, heading_text: str,
+        new_children: List[Dict[str, Any]],
+    ) -> bool:
+        """Replace all children of a toggle heading with new blocks.
+
+        1. Finds toggle by heading_text
+        2. Deletes all existing children
+        3. Appends new_children
+        """
+        toggle_id = self.find_toggle_by_text(page_id, heading_text)
+        if not toggle_id:
+            log.warning("Toggle '%s' not found on page %s", heading_text, page_id)
+            return False
+
+        # Delete existing children
+        existing = self.get_block_children(toggle_id)
+        for child in existing:
+            self.delete_block(child["id"])
+
+        # Append new children
+        if new_children:
+            return self.append_children(toggle_id, new_children)
+        return True
+
+    # ---- To-do / Plan section API ----
+
+    def get_todo_children(
+        self, block_id: str
+    ) -> List[Dict[str, Any]]:
+        """Get to_do blocks that are children of a toggle heading.
+
+        Returns: [{"id": str, "text": str, "checked": bool}, ...]
+        """
+        children = self.get_block_children(block_id)
+        todos = []
+        for child in children:
+            if child.get("type") != "to_do":
+                continue
+            td = child.get("to_do", {})
+            rt = td.get("rich_text", [])
+            text = "".join(r.get("plain_text", "") for r in rt).strip()
+            if text:
+                todos.append({
+                    "id": child["id"],
+                    "text": text,
+                    "checked": td.get("checked", False),
+                })
+        return todos
+
+    def update_todo_checked(self, block_id: str, checked: bool) -> bool:
+        """Update the checked state of a to_do block."""
+        url = f"{self.API_URL}/blocks/{block_id}"
+        payload = {"to_do": {"checked": checked}}
+        resp = self._request("patch", url, json=payload)
+        if resp.status_code == 200:
+            return True
+        log.error(
+            "Failed to update to_do %s: %s %s",
+            block_id, resp.status_code, resp.text,
+        )
+        return False
+
+    def create_todo_block(
+        self, parent_id: str, text: str, checked: bool = False
+    ) -> Optional[str]:
+        """Create a to_do block inside a parent (toggle heading).
+
+        Returns: block_id of created block, or None.
+        """
+        children = [
+            {
+                "object": "block",
+                "type": "to_do",
+                "to_do": {
+                    "rich_text": [
+                        {"type": "text", "text": {"content": text}}
+                    ],
+                    "checked": checked,
+                },
+            }
+        ]
+        url = f"{self.API_URL}/blocks/{parent_id}/children"
+        resp = self._request("patch", url, json={"children": children})
+        if resp.status_code == 200:
+            results = resp.json().get("results", [])
+            return results[0]["id"] if results else None
+        log.error(
+            "Failed to create to_do in %s: %s %s",
+            parent_id, resp.status_code, resp.text,
+        )
+        return None
+
+    def update_links_callout(
+        self,
+        page_id: str,
+        jira_key: str,
+        jira_url: str,
+        confluence_url: Optional[str] = None,
+    ) -> bool:
+        """Find and update (or create) the 🔗 links callout with hyperlinks."""
+        # Build rich_text with hyperlinks
+        rich_text: List[Dict[str, Any]] = [
+            {"type": "text", "text": {"content": "Jira: "}, "annotations": {"bold": True}},
+            {"type": "text", "text": {"content": jira_key, "link": {"url": jira_url}}},
+        ]
+        if confluence_url:
+            rich_text.append({"type": "text", "text": {"content": " | "}})
+            rich_text.append(
+                {"type": "text", "text": {"content": "Confluence: "}, "annotations": {"bold": True}}
+            )
+            rich_text.append(
+                {"type": "text", "text": {"content": "ТЗ", "link": {"url": confluence_url}}}
+            )
+
+        # Try to find existing callout
+        blocks = self.get_block_children(page_id)
+        for block in blocks:
+            if block.get("type") != "callout":
+                continue
+            icon = block.get("callout", {}).get("icon", {})
+            if icon.get("emoji") == "🔗":
+                return self.update_block_text(block["id"], "callout", rich_text)
+
+        # Not found — create new callout at the top of the page
+        callout_block = {
+            "object": "block",
+            "type": "callout",
+            "callout": {
+                "rich_text": rich_text,
+                "icon": {"type": "emoji", "emoji": "🔗"},
+                "color": "purple_background",
+            },
+        }
+        # Also add divider after callout
+        divider_block = {"object": "block", "type": "divider", "divider": {}}
+        return self.append_children(page_id, [callout_block, divider_block])
+
+    def get_tz_content(self, page_id: str) -> Optional[str]:
+        """Extract text from the 'ТЗ' or 'Техническое задание' toggle on a Notion page.
+
+        Returns plain text or None if toggle not found.
+        """
+        heading_id = self.find_toggle_by_text(page_id, "ТЗ")
+        if not heading_id:
+            heading_id = self.find_toggle_by_text(page_id, "Техническое задание")
+        if not heading_id:
+            return None
+
+        children = self.get_block_children(heading_id)
+        parts = []
+        for child in children:
+            child_type = child.get("type", "")
+            type_data = child.get(child_type, {})
+            rt = type_data.get("rich_text", [])
+            text = "".join(r.get("plain_text", "") for r in rt).strip()
+            if text:
+                parts.append(text)
+        return "\n\n".join(parts) if parts else None
+
+    def add_plan_section(
+        self, page_id: str, items: List[Dict[str, str]]
+    ) -> Optional[str]:
+        """Add a 'План выполнения' toggle heading with to_do blocks to a page.
+
+        Args:
+            page_id: Notion page ID.
+            items: [{"title": "...", "checked": False}, ...] — to_do items.
+
+        Returns: heading block_id or None.
+        """
+        todo_blocks = [
+            {
+                "object": "block",
+                "type": "to_do",
+                "to_do": {
+                    "rich_text": [
+                        {"type": "text", "text": {"content": item["title"]}}
+                    ],
+                    "checked": item.get("checked", False),
+                },
+            }
+            for item in items
+        ]
+
+        divider_block = {"object": "block", "type": "divider", "divider": {}}
+
+        heading_block = {
+            "object": "block",
+            "type": "heading_2",
+            "heading_2": {
+                "rich_text": [
+                    {"type": "text", "text": {"content": "План выполнения"}}
+                ],
+                "is_toggleable": True,
+            },
+        }
+
+        # Append divider + heading, then add children to heading
+        url = f"{self.API_URL}/blocks/{page_id}/children"
+        resp = self._request(
+            "patch", url, json={"children": [divider_block, heading_block]}
+        )
+        if resp.status_code != 200:
+            log.error(
+                "Failed to add plan heading to %s: %s %s",
+                page_id, resp.status_code, resp.text,
+            )
+            return None
+
+        # results[0] = divider, results[1] = heading
+        results = resp.json().get("results", [])
+        heading_id = results[1].get("id") if len(results) > 1 else None
+        if not heading_id:
+            return None
+
+        # Add to_do blocks as children of the toggle heading
+        if todo_blocks:
+            self.append_children(heading_id, todo_blocks)
+
+        return heading_id

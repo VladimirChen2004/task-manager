@@ -12,29 +12,38 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Автоматизация управления задачами: связка **Notion** <-> **Jira** <-> **Confluence**.
 
-Пользователь ведёт задачи в Notion (доска "Tasks 2026"). Этот проект обеспечивает:
-1. При создании задачи через `/notion-task` — автоматическое создание issue в Jira VC (nfware.atlassian.net)
-2. Jira Automation (настроено в UI) — автоматическое создание Confluence-страницы с ТЗ при создании issue
-3. Sync-скрипт — двусторонняя синхронизация статусов Jira ↔ Notion + прогресс подзадач
+Пользователь ведёт задачи в Notion (доска "Tasks 2026"). Демон на сервере автоматически:
+1. Создаёт Jira issue для новых Notion-задач (и наоборот)
+2. Синхронизирует статусы двунаправленно (Jira wins при конфликте)
+3. Синхронизирует подзадачи Jira ↔ to-do чекбоксы Notion
+4. Создаёт/обновляет Confluence-страницы (ТЗ, прогресс)
+5. Поддерживает гиперссылки между всеми тремя системами
+
+### Где что работает
+
+| Компонент | Где | Как |
+|-----------|-----|-----|
+| Демон (`sync_daemon.py`) | **Сервер** `vchen@10.20.40.232` | tmux `task-sync`, цикл ~60 сек |
+| Разработка | **Ноутбук** (macOS) | venv, `make deploy` → rsync на сервер |
+| Skills (`/notion-task`, etc.) | **Ноутбук** | Claude Code вызывает локальные скрипты |
 
 ### Архитектура потока данных
 
 ```
-Пользователь → /notion-task (Claude Code skill)
-    ├── 1. Создаёт issue в Jira VC (jira_vchen.py create)
-    ├── 2. Создаёт подзадачи в Jira (jira_vchen.py create-subtasks) — опционально
-    ├── 3. Создаёт страницу в Notion (MCP: notion-create-pages) с Jira Key
-    └── Jira Automation (no-code, настроено в Jira UI)
-          └── Создаёт Confluence-страницу с шаблоном ТЗ
+Daemon (на сервере, tmux task-sync, каждые 60 сек):
+    sync_daemon.py --verbose
+    ├── Фаза 1: Notion→Jira creation (новые задачи без Jira Key)
+    ├── Фаза 2: Jira→Notion creation (новые issue без Notion-страницы)
+    ├── Фаза 3: BidirectionalSync (статус/приоритет: delta + timestamp при конфликте)
+    ├── Фаза 4: Deleted page detection + template backfill
+    ├── Фаза 5: Subtask↔Todo sync (подзадачи Jira ↔ чекбоксы Notion)
+    ├── Фаза 6: Confluence sync (создание/обновление страниц, прогресс)
+    └── Фаза 7: SectionSync (контент Notion ↔ Confluence)
 
-/notion-status (Claude Code skill)
-    ├── Обновляет Status в Notion
-    └── Шаг 3.5: transition_issue() → обновляет статус в Jira
-
-Cron (каждые 10 мин, на сервере в tmux):
-    jira_notion_sync.py --bidirectional --with-progress
-    ├── Jira → Notion: статусы + прогресс подзадач в контент страницы
-    └── Notion → Jira: обнаружение ручных изменений статуса в Notion UI
+Ручное создание:
+    /notion-task (Claude Code skill) → Jira + Notion + Confluence
+    /notion-status → обновление статуса
+    /notion-daily → дневные логи
 ```
 
 ---
@@ -42,29 +51,40 @@ Cron (каждые 10 мин, на сервере в tmux):
 ## Структура пакета
 
 ```
-taskautomation/           # Python-пакет
-├── config.py             # env, маппинги, константы (единственное место)
-├── jira_client.py        # класс JiraVCHEN (проект VC, REST API v3)
-├── notion_client.py      # класс NotionClient (REST API + Block API)
-├── sync.py               # JiraToNotionSync, NotionToJiraSync, ProgressSync
-└── cli.py                # единый CLI (main_jira, main_sync)
+taskautomation/               # Python-пакет
+├── config.py                  # env, маппинги, константы (единственное место)
+├── jira_client.py             # класс JiraVCHEN (проект VC, REST API v3, ADF)
+├── notion_client.py           # класс NotionClient (REST API + Block API)
+├── confluence_client.py       # класс ConfluenceClient (REST API v1, XHTML)
+├── sync.py                    # 6 sync-классов (creators, syncs, ConfluenceSync)
+├── daemon.py                  # SyncDaemon — фоновый цикл с graceful shutdown
+└── cli.py                     # единый CLI (main_jira, main_sync, main_daemon)
 
-jira_vchen.py             # shim → taskautomation.cli.main_jira()
-jira_notion_sync.py       # shim → taskautomation.cli.main_sync()
-deploy/                   # deploy.sh, sync_wrapper.sh, crontab.example
-Makefile                  # make sync, make deploy, make test
+jira_vchen.py                  # shim → taskautomation.cli.main_jira()
+jira_notion_sync.py            # shim → taskautomation.cli.main_sync()
+sync_daemon.py                 # shim → taskautomation.cli.main_daemon()
+cleanup_and_recreate.py        # миграционный скрипт (удаление + пересоздание)
+deploy/                        # deploy.sh, sync_wrapper.sh, crontab.example
+Makefile                       # make daemon, make sync, make deploy, make test
 ```
 
-**Shim-файлы** в корне сохраняют обратную совместимость — скиллы ссылаются на абсолютные пути к ним.
+**Shim-файлы** в корне — скиллы ссылаются на абсолютные пути к ним.
 
 ### Зависимости между модулями
 
-- `config.py` — загружает `.env`, содержит все маппинги и константы. Импортируется всеми.
-- `jira_client.py` ← `config.py` (JiraConfig, маппинги)
-- `notion_client.py` ← `config.py` (NotionConfig, get_progress_emoji)
-- `sync.py` ← `jira_client.py` + `notion_client.py` + `config.py`
-- `cli.py` ← `jira_client.py` + `sync.py`
-- `.sync_state.json` — создаётся автоматически, хранит время sync + known_notion_statuses для bidirectional
+```
+config.py ← загружает .env, все маппинги и константы
+    ↑
+jira_client.py ← JiraConfig, маппинги
+notion_client.py ← NotionConfig, get_progress_emoji
+confluence_client.py ← ConfluenceConfig
+    ↑
+sync.py ← jira_client + notion_client + confluence_client + config
+    ↑
+daemon.py ← sync + все клиенты
+    ↑
+cli.py ← daemon + sync + jira_client
+```
 
 ---
 
@@ -72,47 +92,47 @@ Makefile                  # make sync, make deploy, make test
 
 ```bash
 PYTHON=/Users/nfware/Documents/my_prjcts/task-automation/venv/bin/python3
-SCRIPT=/Users/nfware/Documents/my_prjcts/task-automation/jira_vchen.py
-SYNC=/Users/nfware/Documents/my_prjcts/task-automation/jira_notion_sync.py
 ```
 
-### Jira CLI (jira_vchen.py)
+### Jira CLI
 
 ```bash
-$PYTHON $SCRIPT create --title "Название" --description "Описание" --priority Medium --labels "development"
-$PYTHON $SCRIPT create-subtasks VC-42 --subtasks '[{"title":"подзадача 1"}]'
-$PYTHON $SCRIPT get VC-42
-$PYTHON $SCRIPT list-active
-$PYTHON $SCRIPT recently-updated --minutes 30
-$PYTHON $SCRIPT discover-statuses
-$PYTHON $SCRIPT discover-issue-types
-
-# Transitions (для бидирекционального sync)
-$PYTHON $SCRIPT transition VC-42 --status "В работе"
-$PYTHON $SCRIPT transitions VC-42    # показать доступные переходы
+$PYTHON jira_vchen.py create --title "Название" --description "Описание" --priority Medium
+$PYTHON jira_vchen.py create-subtasks VC-42 --subtasks '[{"title":"подзадача 1"}]'
+$PYTHON jira_vchen.py get VC-42
+$PYTHON jira_vchen.py list-active
+$PYTHON jira_vchen.py recently-updated --minutes 30
+$PYTHON jira_vchen.py discover-statuses
+$PYTHON jira_vchen.py transition VC-42 --status "В работе"
 ```
 
-### Sync (jira_notion_sync.py)
+### Daemon
 
 ```bash
-$PYTHON $SYNC                          # Jira→Notion, последние 15 мин
-$PYTHON $SYNC --full                   # Jira→Notion, все активные
-$PYTHON $SYNC --dry-run --full         # dry-run
-$PYTHON $SYNC --with-progress          # + прогресс подзадач в контент
-$PYTHON $SYNC --reverse                # Notion→Jira только
-$PYTHON $SYNC --bidirectional          # оба направления
-$PYTHON $SYNC --bidirectional --with-progress --full  # полный двусторонний + прогресс
-$PYTHON $SYNC --verbose                # debug logging
+$PYTHON sync_daemon.py --verbose              # запуск
+$PYTHON sync_daemon.py --dry-run --verbose    # dry-run
+$PYTHON sync_daemon.py --no-creation          # только статусы
+$PYTHON sync_daemon.py --interval 60          # кастомный интервал
+```
+
+### Sync (одноразовый)
+
+```bash
+$PYTHON jira_notion_sync.py                   # Jira→Notion, последние 15 мин
+$PYTHON jira_notion_sync.py --full            # все активные
+$PYTHON jira_notion_sync.py --bidirectional   # оба направления
+$PYTHON jira_notion_sync.py --with-progress   # + прогресс подзадач
+$PYTHON jira_notion_sync.py --migrate         # создать Jira для всех Notion без Key
+$PYTHON jira_notion_sync.py --dry-run --full  # dry-run
 ```
 
 ### Makefile
 
 ```bash
-make sync          # инкрементальный Jira→Notion
-make sync-full     # полный Jira→Notion
-make sync-dry      # dry-run
-make sync-progress # полный + прогресс
-make sync-reverse  # Notion→Jira
+make daemon        # запуск демона (verbose)
+make daemon-dry    # демон в dry-run
+make sync          # инкрементальный sync
+make sync-full     # полный sync
 make sync-bidi     # двусторонний
 make deploy        # rsync на сервер
 make test          # pytest
@@ -120,40 +140,79 @@ make test          # pytest
 
 ---
 
-## Jira VC (nfware.atlassian.net)
+## Деплой и сервер
+
+**Сервер:** `vchen@10.20.40.232` (Ubuntu 24.04, ARM64, NVIDIA DGX Spark)
+**Путь:** `/home/vchen/automations/task-automation/`
+**tmux-сессия:** `task-sync`
+
+### Деплой с ноутбука
+
+```bash
+make deploy                    # rsync на сервер + pip install
+```
+
+### Управление на сервере
+
+```bash
+ssh vchen@10.20.40.232
+~/automations/start-all.sh     # запустить все автоматизации
+~/automations/stop-all.sh      # остановить все
+tmux attach -t task-sync       # подключиться к демону (логи)
+```
+
+**Автозапуск:** `@reboot` crontab → `~/automations/start-all.sh`
+
+### Процесс обновления
+
+1. Изменить код на ноутбуке
+2. `make deploy` (rsync)
+3. SSH → перезапустить демон в tmux (или `stop-all.sh && start-all.sh`)
+
+---
+
+## Jira
 
 - **URL:** `https://nfware.atlassian.net`
 - **Проект:** `VC`
 - **Board:** `https://nfware.atlassian.net/jira/core/projects/VC/board`
-- **API:** REST API v3 (direct requests) + python-jira (для transitions/statuses). Гибридный подход т.к. nfware.atlassian.net deprecated `/rest/api/3/search` — используем `/rest/api/3/search/jql`.
+- **API:** REST API v3 (direct requests) + python-jira (для transitions). Endpoint: `/rest/api/3/search/jql` (не deprecated `/search`).
 - **Issue types:** Задача, Подзадача (русские названия)
-- **Описания:** Atlassian Document Format (ADF), не plain text
+- **Описания:** Atlassian Document Format (ADF) с гиперссылками (не plain text)
 
 ### Маппинг статусов
 
 | Notion Status | Jira Status |
 |---|---|
-| Not started | New |
+| Not started | Новое |
 | Idea | Idea |
 | In progress | В работе |
 | Hold | Hold |
-| Done | Done |
-| Archived | (нет маппинга) |
+| Done | Готово |
+| Archived | Archieve |
 
-Маппинги определены в `taskautomation/config.py`: `NOTION_TO_JIRA_STATUS`, `JIRA_TO_NOTION_STATUS`.
+Маппинги в `config.py`: `NOTION_TO_JIRA_STATUS`, `JIRA_TO_NOTION_STATUS`.
 
 ### Маппинг приоритетов
 
-| Notion (Priority property) | Jira Priority |
+| Notion | Jira |
 |---|---|
 | Now | Highest |
 | High | High |
 | Medium (default) | Medium |
 | Low | Low |
 
-### Разрешение конфликтов (bidirectional sync)
+### Разрешение конфликтов (BidirectionalSync)
 
-**Jira побеждает:** сначала запускается Jira→Notion sync, потом Notion→Jira читает уже обновлённые статусы. Notion→Jira только отлавливает ручные изменения в Notion UI.
+Используется delta-детекция через `known_notion_statuses` (dual format: `{"notion": ..., "jira": ...}`):
+
+| Notion изменился? | Jira изменился? | Действие |
+|---|---|---|
+| Нет | Нет | Skip |
+| Да | Нет | Notion → Jira |
+| Нет | Да | Jira → Notion |
+| Да | Да | Timestamp решает (CONFLICT) |
+| Первый раз | — | Записать обе стороны, не синкать |
 
 ---
 
@@ -168,62 +227,119 @@ make test          # pytest
 
 | Property | Type | Значения |
 |----------|------|----------|
-| Task name | title | Название задачи (обязательно) |
+| Task name | title | Название задачи |
 | Status | status | Not started, Idea, In progress, Hold, Archived, Done |
-| Assignee | person | ID пользователя |
-| Due | date | date:Due:start, date:Due:end, date:Due:is_datetime |
 | Summary | text | Краткое описание |
-| Задача | text | Внутренний идентификатор |
-| Приоритетность | select | Срочно |
-| Приоритетность (1) | select | тест, Корп культура, Обучение, Онбординг, Процессы, Развитие, Рекрутинг |
 | Jira Key | text | VC-XX (заполняется автоматически) |
 | Priority | select | Now, High, Medium, Low |
+| Due | date | Срок задачи |
+| Assignee | person | ID пользователя |
 
----
+### Шаблон страницы (создаётся демоном)
 
-## Связанные файлы вне проекта
-
-- **`~/.claude/skills/notion-task/SKILL.md`** — Skill для создания задач. Шаги 2.5 и 2.7 вызывают `jira_vchen.py`.
-- **`~/.claude/skills/notion-status/SKILL.md`** — Skill для обновления статуса. Шаг 3.5 вызывает `jira_vchen.py transition` для синхронизации в Jira.
-- **`~/.claude/skills/notion-daily/SKILL.md`** — Skill для ведения дневных логов в Notion.
-
----
-
-## Деплой
-
-Сервер: `vchen@10.20.40.232` (Ubuntu 24.04, ARM64, NVIDIA DGX Spark).
-
-Проект живёт в `/home/vchen/automations/task-automation/`. Sync запускается в tmux-сессии `task-sync` (цикл каждые 10 мин). Автозапуск при перезагрузке через `@reboot` crontab → `~/automations/start-all.sh`.
-
-```bash
-make deploy                    # rsync на сервер
-# Управление на сервере:
-ssh vchen@10.20.40.232
-~/automations/start-all.sh     # запустить все автоматизации
-~/automations/stop-all.sh      # остановить все
-tmux attach -t task-sync       # подключиться к sync-сессии
+```
+1. Toggle "План выполнения" — to-do чекбоксы (ПЕРВЫМ для быстрого доступа)
+2. Callout 🔗 — гиперссылки: Jira: [VC-XX] | Confluence: [ТЗ]
+3. Divider
+4. Toggle "Минимальный функционал (MVP)" — placeholder
+5. Toggle "Результат" — заполняется по итогу
+6. Toggle "Заметки / Лог" — заметки по ходу работы
+7. Toggle "Описание задачи" — summary (если есть)
+8. Callout 🤖 — "Создано автоматически" (для авто-созданных)
 ```
 
 ---
 
 ## Confluence
 
+- **Инстанс:** тот же `nfware.atlassian.net/wiki`
+- **Space:** `~7120207d46508b6f30445a8f04596b39efdffc` (Personal — Vladimir Chen)
+- **Parent page:** ID `4349132807` ("VC Tasks")
 - **Folder:** `https://nfware.atlassian.net/wiki/spaces/~7120207d46508b6f30445a8f04596b39efdffc/folder/4349460483`
-- Настраивается в Jira UI: VC → Project Settings → Automation → Create rule. Подробный шаблон — в `SETUP.md`.
+- **API:** REST API v1 (storage format / XHTML), та же auth (email + api_token)
+- **Jira Automation** (в Jira UI) также создаёт Confluence-страницы → `find_or_create_page` избегает дубликатов
+
+### Шаблон Confluence страницы (XHTML)
+
+```
+1. Ссылки: [VC-XX (Jira)] | [Notion]  — гиперссылки
+2. <hr/>
+3. Описание задачи (summary)
+4. Минимальный функционал (MVP) — что нужно сделать как минимум
+5. Техническое задание — placeholder для ТЗ
+6. Прогресс — ac:structured-macro status (NOT STARTED / IN PROGRESS / DONE)
+7. План выполнения — ac:task-list с подзадачами
+8. Заметки / Лог — заметки по ходу работы
+```
+
+### Jira описание (ADF)
+
+```
+1. Параграф с описанием задачи (summary)
+2. Rule (разделитель)
+3. Параграф: [Notion](url) | [Confluence (ТЗ)](url) — гиперссылки через ADF marks
+```
+
+---
+
+## Гиперссылки между системами
+
+Все три системы связаны кликабельными ссылками:
+
+| Откуда | Куда | Как |
+|--------|------|-----|
+| **Notion** → Jira | 🔗 callout: `Jira: [VC-XX]` | Notion rich_text link |
+| **Notion** → Confluence | 🔗 callout: `Confluence: [ТЗ]` | Notion rich_text link |
+| **Jira** → Notion | ADF paragraph: `[Notion](url)` | ADF link mark |
+| **Jira** → Confluence | ADF paragraph: `[Confluence (ТЗ)](url)` | ADF link mark |
+| **Confluence** → Jira | `<a href>` в секции Ссылки | XHTML |
+| **Confluence** → Notion | `<a href>` в секции Ссылки | XHTML |
+
+---
+
+## State файл (.sync_state.json)
+
+```json
+{
+  "known_notion_statuses": {"VC-47": {"notion": "Done", "jira": "Done"}, ...},
+  "known_notion_priorities": {"VC-47": {"notion": "Medium", "jira": "Medium"}, ...},
+  "template_backfilled": ["VC-47", "VC-51", ...],
+  "missing_keys": {},
+  "subtask_todos": {"VC-47": {"page_last_edited": "...", "todos": {...}, "subtask_statuses": {...}}},
+  "confluence_linked_keys": ["VC-47", "VC-51", ...],
+  "daemon_last_cycle": "2026-02-19T21:35:09",
+  "daemon_cycle_count": 5,
+  "daemon_last_cycle_seconds": 53.0
+}
+```
+
+- `known_notion_statuses` — dual format для BidirectionalSync (delta-детекция изменений с обеих сторон)
+- `known_notion_priorities` — аналогично для приоритетов
+- `template_backfilled` — страницы, которые уже получили все template-секции
+- `subtask_todos` — кеш для Subtask↔Todo sync
+- `confluence_linked_keys` — какие страницы уже прошли linking (callout + Jira desc + Confluence body)
+
+---
+
+## Связанные Skills
+
+- **`~/.claude/skills/notion-task/SKILL.md`** — создание задач (Jira + Notion + Confluence)
+- **`~/.claude/skills/notion-status/SKILL.md`** — обновление статуса (Notion + Jira transition)
+- **`~/.claude/skills/notion-daily/SKILL.md`** — дневные логи в Notion
 
 ---
 
 ## Окружение
 
 - **Python:** 3.9+ (в venv)
-- **venv:** `/Users/nfware/Documents/my_prjcts/task-automation/venv/`
+- **venv (ноутбук):** `/Users/nfware/Documents/my_prjcts/task-automation/venv/`
+- **venv (сервер):** `/home/vchen/automations/task-automation/venv/`
 - **Зависимости:** jira, requests, python-dotenv
-- **macOS:** Darwin 25.2.0
+- **macOS (ноутбук):** Darwin 25.2.0
+- **Linux (сервер):** Ubuntu 24.04, ARM64
 
 ## Контекст: другие проекты
 
-- **`/Users/nfware/Documents/doc-automation/`** — pipeline документации (Confluence → RST → Sphinx). Тот же Jira (nfware.atlassian.net), но проект DOCS. НЕ СМЕШИВАТЬ.
-- **`/Users/nfware/Documents/my_prjcts/server-monitor-bot/`** — Telegram-бот мониторинга серверов
-- **`/Users/nfware/Documents/my_prjcts/money_analitics/`** — аналитика финансов
-
-Этот проект (`task-automation`) — автономный, не зависит от других проектов.
+- **`doc-automation/`** — pipeline документации (Confluence → RST → Sphinx). Тот же Jira (nfware.atlassian.net), но проект DOCS. НЕ СМЕШИВАТЬ.
+- **`server-monitor-bot/`** — Telegram-бот мониторинга серверов
+- **`money_analitics/`** — аналитика финансов

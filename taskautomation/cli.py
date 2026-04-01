@@ -217,6 +217,11 @@ def main_sync():
         help="Sync both directions (Jira → Notion, then Notion → Jira)",
     )
     parser.add_argument(
+        "--migrate",
+        action="store_true",
+        help="One-time: create Jira issues for all Notion tasks without Jira Key",
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true", help="Debug logging"
     )
 
@@ -235,6 +240,49 @@ def main_sync():
         with_progress=args.with_progress,
         reverse=args.reverse,
         bidirectional=args.bidirectional,
+        migrate=args.migrate,
     )
     if not success:
         sys.exit(1)
+
+
+def main_daemon():
+    """CLI entry point for sync daemon."""
+    from .config import DAEMON_INTERVAL_SECONDS
+    from .daemon import SyncDaemon
+
+    parser = argparse.ArgumentParser(description="Bidirectional sync daemon")
+    parser.add_argument(
+        "--interval", type=int, default=DAEMON_INTERVAL_SECONDS,
+        help=f"Sync interval in seconds (default: {DAEMON_INTERVAL_SECONDS})",
+    )
+    parser.add_argument(
+        "--no-progress", action="store_true",
+        help="Disable subtask progress sync",
+    )
+    parser.add_argument(
+        "--no-creation", action="store_true",
+        help="Disable auto-creation of issues/pages",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Preview mode",
+    )
+    parser.add_argument(
+        "--verbose", "-v", action="store_true", help="Debug logging",
+    )
+
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    daemon = SyncDaemon(
+        interval=args.interval,
+        with_progress=not args.no_progress,
+        with_creation=not args.no_creation,
+        dry_run=args.dry_run,
+    )
+    daemon.run()
