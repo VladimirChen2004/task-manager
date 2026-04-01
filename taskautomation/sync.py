@@ -739,6 +739,12 @@ class NotionToJiraCreator:
     def _add_template_sections(self, page_id, jira_key, description=""):
         _add_template_sections(self.notion, page_id, jira_key, description)
 
+    def _log_stats(self):
+        s = self.stats
+        log.info(
+            "Notion→Jira creation: found=%d, created=%d, skipped=%d, errors=%d",
+            s["found"], s["created"], s["skipped"], s["errors"],
+        )
 
 
 def _add_template_sections(
