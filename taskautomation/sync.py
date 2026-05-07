@@ -435,7 +435,8 @@ class NotionToJiraSync:
         self.notion = notion
         self.dry_run = dry_run
         self.stats = {"checked": 0, "updated": 0, "skipped": 0,
-                      "skipped_orphan": 0, "errors": 0}
+                      "skipped_orphan": 0, "skipped_unknown": 0,
+                      "errors": 0}
         self._state = _load_state()
         self._known = self._state.get("known_notion_statuses", {})
         self._orphans = OrphanResolver(STATE_FILE)
@@ -500,13 +501,18 @@ class NotionToJiraSync:
             if not jira_key or jira_key in backfilled:
                 continue
 
-            # Probe Jira so a freshly-orphaned (and not-yet-tombstoned)
-            # key is caught here, in the first phase that would write
-            # to Notion. probe_and_resolve marks/clears the tombstone
-            # for downstream phases the same cycle.
-            if self._orphans.probe_and_resolve(jira_key, self.jira):
+            # FAIL-CLOSED probe: backfill writes to Notion. We must
+            # not write when we don't know whether the Jira issue is
+            # alive — a transient Jira outage on a freshly-orphaned
+            # key would otherwise cause an orphan write.
+            verdict = self._orphans.probe_for_write(jira_key, self.jira)
+            if verdict == self._orphans.WRITE_ORPHANED:
                 self.stats["skipped_orphan"] += 1
                 continue
+            if verdict == self._orphans.WRITE_UNKNOWN:
+                self.stats["skipped_unknown"] += 1
+                continue
+            # verdict == WRITE_ALIVE — safe to proceed.
 
             page_id = page["id"]
             # Quick check: if MVP toggle exists, assume all sections present
@@ -586,6 +592,7 @@ class NotionToJiraSync:
                         "(transient); will retry next cycle",
                         jira_key,
                     )
+                    self.stats["skipped_unknown"] += 1
                     continue
 
                 success = self.jira.delete_issue(jira_key)
@@ -618,11 +625,12 @@ class NotionToJiraSync:
         s = self.stats
         log.info(
             "Notion→Jira: checked=%d, updated=%d, skipped=%d, "
-            "skipped_orphan=%d, errors=%d",
+            "skipped_orphan=%d, skipped_unknown=%d, errors=%d",
             s["checked"],
             s["updated"],
             s["skipped"],
             s.get("skipped_orphan", 0),
+            s.get("skipped_unknown", 0),
             s["errors"],
         )
 
@@ -1306,7 +1314,9 @@ class SubtaskTodoSync:
             "pages_checked": 0, "todos_synced": 0,
             "subtasks_created": 0, "subtasks_deleted": 0,
             "todos_created": 0,
-            "checked_updated": 0, "skipped_orphan": 0, "errors": 0,
+            "checked_updated": 0,
+            "skipped_orphan": 0, "skipped_unknown": 0,
+            "errors": 0,
         }
         self._state = _load_state()
         self._known = self._state.get("subtask_todos", {})
@@ -1323,12 +1333,17 @@ class SubtaskTodoSync:
                 continue
             self.stats["pages_checked"] += 1
 
-            # Skip orphaned keys before any Jira fetch — avoids the
-            # 404 → exception → ERROR-log cycle. Notion / Confluence
-            # are left untouched; status reconciliation is up to the
-            # operator (see tests/manual/diagnose_orphan_jira_key.py).
-            if self._orphans.probe_and_resolve(jira_key, self.jira):
+            # FAIL-CLOSED probe: _sync_page reaches into _execute_actions
+            # which writes to Notion (create_todo / check_todo /
+            # uncheck_todo) and Confluence (set_conf_item). On a
+            # transient Jira outage we must not proceed — we'd write
+            # into what could be a real orphan.
+            verdict = self._orphans.probe_for_write(jira_key, self.jira)
+            if verdict == self._orphans.WRITE_ORPHANED:
                 self.stats["skipped_orphan"] += 1
+                continue
+            if verdict == self._orphans.WRITE_UNKNOWN:
+                self.stats["skipped_unknown"] += 1
                 continue
 
             try:
@@ -2144,11 +2159,14 @@ class SubtaskTodoSync:
         log.info(
             "Subtask↔Todo: pages=%d, synced=%d, "
             "subtasks_created=%d, todos_created=%d, "
-            "checked_updated=%d, skipped_orphan=%d, errors=%d",
+            "checked_updated=%d, skipped_orphan=%d, "
+            "skipped_unknown=%d, errors=%d",
             s["pages_checked"], s["todos_synced"],
             s["subtasks_created"],
             s["todos_created"], s["checked_updated"],
-            s.get("skipped_orphan", 0), s["errors"],
+            s.get("skipped_orphan", 0),
+            s.get("skipped_unknown", 0),
+            s["errors"],
         )
 
 
@@ -2170,7 +2188,8 @@ class ConfluenceSync:
         self.confluence = confluence
         self.dry_run = dry_run
         self.stats = {"checked": 0, "created": 0, "updated": 0, "linked": 0,
-                      "skipped": 0, "skipped_orphan": 0, "errors": 0}
+                      "skipped": 0, "skipped_orphan": 0,
+                      "skipped_unknown": 0, "errors": 0}
         self._state = _load_state()
         self._linked_keys = set(self._state.get("confluence_linked_keys", []))
         self._orphans = OrphanResolver(STATE_FILE)
@@ -2186,12 +2205,16 @@ class ConfluenceSync:
                 continue
             self.stats["checked"] += 1
 
-            # Skip orphaned keys (Jira issue gone) — probe once per key
-            # per phase, mark/clear tombstone, then read tombstone state.
-            # WARN, not ERROR: this is a known reconciliation gap, not
-            # a sync failure. Notion / Confluence are left untouched.
-            if self._orphans.probe_and_resolve(jira_key, self.jira):
+            # FAIL-CLOSED probe: _sync_page calls find_or_create_page,
+            # update_page, update_links_callout — all destructive
+            # writes. Unknown Jira state must skip the cycle, not
+            # fail-open into an orphan write.
+            verdict = self._orphans.probe_for_write(jira_key, self.jira)
+            if verdict == self._orphans.WRITE_ORPHANED:
                 self.stats["skipped_orphan"] += 1
+                continue
+            if verdict == self._orphans.WRITE_UNKNOWN:
+                self.stats["skipped_unknown"] += 1
                 continue
 
             try:
@@ -2331,9 +2354,10 @@ class ConfluenceSync:
         s = self.stats
         log.info(
             "Confluence: checked=%d, created=%d, linked=%d, updated=%d, "
-            "skipped=%d, skipped_orphan=%d, errors=%d",
+            "skipped=%d, skipped_orphan=%d, skipped_unknown=%d, errors=%d",
             s["checked"], s["created"], s["linked"], s["updated"],
-            s["skipped"], s.get("skipped_orphan", 0), s["errors"],
+            s["skipped"], s.get("skipped_orphan", 0),
+            s.get("skipped_unknown", 0), s["errors"],
         )
 
 
@@ -2367,7 +2391,8 @@ class SectionSync:
         self.dry_run = dry_run
         self.stats = {
             "checked": 0, "notion_to_conf": 0, "conf_to_notion": 0,
-            "conflicts": 0, "skipped": 0, "skipped_orphan": 0, "errors": 0,
+            "conflicts": 0, "skipped": 0, "skipped_orphan": 0,
+            "skipped_unknown": 0, "errors": 0,
         }
         self._state = _load_state()
         self._section_state: Dict[str, Any] = self._state.get("section_sync", {})
@@ -2393,14 +2418,17 @@ class SectionSync:
                 continue
             self.stats["checked"] += 1
 
-            # SectionSync runs last in the daemon cycle today, so a
-            # tombstone written by SubtaskTodoSync / ConfluenceSync
-            # would already be visible. We still call probe_and_resolve
-            # here (one Jira GET per orphan) so SectionSync stays
-            # correct regardless of phase ordering — the daemon could
-            # in principle reorder phases or run SectionSync standalone.
-            if self._orphans.probe_and_resolve(jira_key, self.jira):
+            # FAIL-CLOSED probe: _sync_task writes via
+            # notion.replace_toggle_content and confluence.update_page.
+            # If Jira state is unknown we skip rather than risk
+            # writing into an orphan. Independence from phase ordering
+            # is preserved because the probe runs in this phase too.
+            verdict = self._orphans.probe_for_write(jira_key, self.jira)
+            if verdict == self._orphans.WRITE_ORPHANED:
                 self.stats["skipped_orphan"] += 1
+                continue
+            if verdict == self._orphans.WRITE_UNKNOWN:
+                self.stats["skipped_unknown"] += 1
                 continue
 
             try:
@@ -2540,10 +2568,11 @@ class SectionSync:
         s = self.stats
         log.info(
             "SectionSync: checked=%d, N→C=%d, C→N=%d, conflicts=%d, "
-            "skipped=%d, skipped_orphan=%d, errors=%d",
+            "skipped=%d, skipped_orphan=%d, skipped_unknown=%d, errors=%d",
             s["checked"], s["notion_to_conf"], s["conf_to_notion"],
             s["conflicts"], s["skipped"],
-            s.get("skipped_orphan", 0), s["errors"],
+            s.get("skipped_orphan", 0),
+            s.get("skipped_unknown", 0), s["errors"],
         )
 
 

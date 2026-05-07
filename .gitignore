@@ -12,3 +12,4 @@ venv/
 .mypy_cache/
 migrate_kanban.py
 migration_mapping.json
+claude-logs/

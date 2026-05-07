@@ -170,6 +170,105 @@ class TestProbeAndResolve:
         assert r.is_orphaned("VC-114") is True
 
 
+class TestProbeForWrite:
+    """``probe_for_write`` is a fail-closed tri-state probe used by
+    write paths (backfill, sync_page when it leads to writes, etc.).
+
+    Verdict matrix:
+    - issue_exists True   → "alive"     + tombstone cleared
+    - issue_exists False  → "orphaned"  + tombstone marked
+    - issue_exists None   → "unknown"   + tombstone untouched
+    - exception           → "unknown"   + tombstone untouched
+    """
+
+    def test_alive_clears_existing_tombstone(self, tmp_path):
+        from taskautomation.orphan_keys import OrphanResolver
+        sf = make_state_file(tmp_path)
+        r = OrphanResolver(sf)
+        r.mark_orphaned("VC-114", source="jira_404")
+        jira = MagicMock()
+        jira.issue_exists.return_value = True
+
+        verdict = r.probe_for_write("VC-114", jira)
+
+        assert verdict == r.WRITE_ALIVE
+        assert r.is_orphaned("VC-114") is False
+
+    def test_orphaned_marks_tombstone(self, tmp_path):
+        from taskautomation.orphan_keys import OrphanResolver
+        sf = make_state_file(tmp_path)
+        r = OrphanResolver(sf)
+        jira = MagicMock()
+        jira.issue_exists.return_value = False
+
+        verdict = r.probe_for_write("VC-114", jira)
+
+        assert verdict == r.WRITE_ORPHANED
+        assert r.is_orphaned("VC-114") is True
+
+    def test_unknown_returns_unknown_no_tombstone_change(self, tmp_path):
+        """The critical fail-closed property: unknown probe must not
+        invent a tombstone (we don't know it's orphaned) AND must not
+        return ALIVE (caller would write into a possible orphan).
+        """
+        from taskautomation.orphan_keys import OrphanResolver
+        sf = make_state_file(tmp_path)
+        r = OrphanResolver(sf)
+        jira = MagicMock()
+        jira.issue_exists.return_value = None
+
+        verdict = r.probe_for_write("VC-999", jira)
+
+        assert verdict == r.WRITE_UNKNOWN
+        # No tombstone fabricated.
+        assert r.is_orphaned("VC-999") is False
+        on_disk = json.loads(sf.read_text())
+        assert "VC-999" not in on_disk.get("orphaned_jira_keys", {})
+
+    def test_unknown_preserves_existing_tombstone(self, tmp_path):
+        """If a tombstone already exists and the probe goes unknown,
+        we must not clear it — we still don't have evidence the issue
+        is alive."""
+        from taskautomation.orphan_keys import OrphanResolver
+        sf = make_state_file(tmp_path)
+        r = OrphanResolver(sf)
+        r.mark_orphaned("VC-114", source="jira_404")
+        jira = MagicMock()
+        jira.issue_exists.return_value = None
+
+        verdict = r.probe_for_write("VC-114", jira)
+
+        assert verdict == r.WRITE_UNKNOWN
+        assert r.is_orphaned("VC-114") is True
+
+    def test_exception_returns_unknown(self, tmp_path):
+        """Any exception out of issue_exists must be caught and turned
+        into UNKNOWN — write paths never see a raised probe error."""
+        from taskautomation.orphan_keys import OrphanResolver
+        sf = make_state_file(tmp_path)
+        r = OrphanResolver(sf)
+        jira = MagicMock()
+        jira.issue_exists.side_effect = RuntimeError("network blip")
+
+        verdict = r.probe_for_write("VC-999", jira)
+
+        assert verdict == r.WRITE_UNKNOWN
+        assert r.is_orphaned("VC-999") is False
+
+    def test_verdict_constants_are_strings_not_collisions(self):
+        """Smoke: the three verdict constants are distinct strings,
+        not booleans or accidentally-equal sentinels."""
+        from taskautomation.orphan_keys import OrphanResolver
+        verdicts = {
+            OrphanResolver.WRITE_ALIVE,
+            OrphanResolver.WRITE_ORPHANED,
+            OrphanResolver.WRITE_UNKNOWN,
+        }
+        assert len(verdicts) == 3
+        for v in verdicts:
+            assert isinstance(v, str) and v
+
+
 class TestIssueExistsClient:
     """JiraVCHEN.issue_exists must distinguish 404 from other failures."""
 
@@ -273,7 +372,7 @@ class TestConfluenceSyncIntegration:
             cs.dry_run = False
             cs.stats = {
                 "checked": 0, "created": 0, "updated": 0, "linked": 0,
-                "skipped": 0, "skipped_orphan": 0, "errors": 0,
+                "skipped": 0, "skipped_orphan": 0, "skipped_unknown": 0, "errors": 0,
             }
             cs._state = {}
             cs._linked_keys = set()
@@ -330,7 +429,9 @@ class TestConfluenceSyncIntegration:
     def test_existing_tombstone_persists_when_jira_unknown(self, tmp_path):
         """If issue_exists returns None (5xx / network), the existing
         tombstone is kept and the key is still skipped — no destructive
-        action runs while we wait for clarity."""
+        action runs while we wait for clarity. Under fail-closed
+        semantics the verdict is "unknown" (not "orphaned"), so the
+        skipped_unknown counter advances and tombstone is untouched."""
         from taskautomation.orphan_keys import OrphanResolver
         cs, sf = self._make_sync(tmp_path)
         # Pre-seed tombstone
@@ -358,8 +459,11 @@ class TestConfluenceSyncIntegration:
 
         cs.jira.get_issue.assert_not_called()
         cs.confluence.find_or_create_page.assert_not_called()
-        assert cs.stats["skipped_orphan"] == 1
+        # Verdict is "unknown" — skipped_unknown advances, not skipped_orphan.
+        assert cs.stats["skipped_unknown"] == 1
+        assert cs.stats["skipped_orphan"] == 0
         assert cs.stats["errors"] == 0
+        # Pre-existing tombstone is untouched by the unknown probe.
         on_disk = json.loads(sf.read_text())
         assert "VC-114" in on_disk.get("orphaned_jira_keys", {})
 
@@ -477,7 +581,7 @@ class TestSubtaskTodoSyncIntegration:
                 "pages_checked": 0, "todos_synced": 0,
                 "subtasks_created": 0, "subtasks_deleted": 0,
                 "todos_created": 0, "checked_updated": 0,
-                "skipped_orphan": 0, "errors": 0,
+                "skipped_orphan": 0, "skipped_unknown": 0, "errors": 0,
             }
             s._state = {}
             s._known = {}
@@ -526,6 +630,29 @@ class TestSubtaskTodoSyncIntegration:
             "use read-modify-write."
         )
 
+    def test_unknown_jira_skips_write_no_tombstone(self, tmp_path):
+        """FAIL-CLOSED: when Jira probe returns None, _sync_page must
+        NOT run (it would reach destructive Notion/Confluence writes),
+        no tombstone is fabricated, skipped_unknown advances."""
+        s, sf = self._make_sync(tmp_path)
+        s.notion.query_all_pages_with_jira_key.return_value = [
+            _notion_page("VC-200"),
+        ]
+        s.jira.issue_exists.return_value = None  # transient
+        s._sync_page = MagicMock()
+
+        import taskautomation.sync as sync_module
+        sync_module.time.sleep = lambda *a, **kw: None
+
+        s.run()
+
+        s._sync_page.assert_not_called()
+        on_disk = json.loads(sf.read_text())
+        assert "VC-200" not in on_disk.get("orphaned_jira_keys", {})
+        assert s.stats["skipped_unknown"] == 1
+        assert s.stats["skipped_orphan"] == 0
+        assert s.stats["errors"] == 0
+
 
 class TestSectionSyncIntegration:
     """SectionSync doesn't probe Jira directly — it consults the
@@ -548,7 +675,7 @@ class TestSectionSyncIntegration:
             s.dry_run = False
             s.stats = {
                 "checked": 0, "notion_to_conf": 0, "conf_to_notion": 0,
-                "conflicts": 0, "skipped": 0, "skipped_orphan": 0, "errors": 0,
+                "conflicts": 0, "skipped": 0, "skipped_orphan": 0, "skipped_unknown": 0, "errors": 0,
             }
             s._state = {}
             s._section_state = {}
@@ -621,6 +748,27 @@ class TestSectionSyncIntegration:
         s._sync_task.assert_called_once()
         assert s.stats["skipped_orphan"] == 0
 
+    def test_unknown_jira_skips_write_no_tombstone(self, tmp_path):
+        """FAIL-CLOSED: SectionSync writes both Notion and Confluence
+        from _sync_task. Unknown probe must skip without tombstone."""
+        s, sf = self._make_sync(tmp_path)
+        s.jira.issue_exists.return_value = None  # transient
+        s.notion.query_all_pages_with_jira_key.return_value = [
+            _notion_page("VC-200"),
+        ]
+        s._sync_task = MagicMock()
+
+        import taskautomation.sync as sync_module
+        sync_module.time.sleep = lambda *a, **kw: None
+
+        s.run()
+
+        s._sync_task.assert_not_called()
+        on_disk = json.loads(sf.read_text())
+        assert "VC-200" not in on_disk.get("orphaned_jira_keys", {})
+        assert s.stats["skipped_unknown"] == 1
+        assert s.stats["skipped_orphan"] == 0
+
 
 class TestNotionToJiraDeletePath:
     """When a Notion page disappears, NotionToJiraSync._handle_deleted_pages
@@ -642,7 +790,7 @@ class TestNotionToJiraDeletePath:
             s.dry_run = False
             s.stats = {
                 "checked": 0, "updated": 0, "skipped": 0,
-                "skipped_orphan": 0, "errors": 0,
+                "skipped_orphan": 0, "skipped_unknown": 0, "errors": 0,
             }
             # Pretend VC-114 has been known for a while and is now
             # missing from current Notion query for 2nd consecutive
@@ -690,7 +838,7 @@ class TestNotionToJiraDeletePath:
 
     def test_transient_probe_failure_does_not_delete_or_mark(self, tmp_path):
         """issue_exists returning None → skip this cycle, retry later.
-        No delete, no tombstone, no errors."""
+        No delete, no tombstone, skipped_unknown counter advances."""
         s, sf = self._make_sync(tmp_path)
         s.jira.issue_exists.return_value = None
 
@@ -701,6 +849,9 @@ class TestNotionToJiraDeletePath:
         assert "VC-114" not in on_disk.get("orphaned_jira_keys", {})
         # Local state preserved for next cycle's retry
         assert "VC-114" in s._known
+        # skipped_unknown advanced; skipped_orphan did not.
+        assert s.stats["skipped_unknown"] == 1
+        assert s.stats["skipped_orphan"] == 0
 
     def test_jira_200_lets_delete_proceed(self, tmp_path):
         """Live issue → normal delete path. Tombstone must NOT be set."""
@@ -740,7 +891,7 @@ class TestNotionToJiraBackfillSkipsOrphan:
             s.dry_run = False
             s.stats = {
                 "checked": 0, "updated": 0, "skipped": 0,
-                "skipped_orphan": 0, "errors": 0,
+                "skipped_orphan": 0, "skipped_unknown": 0, "errors": 0,
             }
             s._state = {"template_backfilled": []}
             s._known = {}
@@ -852,14 +1003,17 @@ class TestNotionToJiraBackfillSkipsOrphan:
         assert called_with == [("p2", "VC-200")]
         assert s.stats["skipped_orphan"] == 0
 
-    def test_transient_jira_failure_does_not_mark_or_skip(
+    def test_transient_jira_failure_skips_write_but_does_not_tombstone(
         self, tmp_path, monkeypatch
     ):
-        """If Jira returns 5xx / network error, issue_exists() returns
-        None. probe_and_resolve must NOT mark a tombstone and must NOT
-        clear an existing one. Backfill must proceed normally for keys
-        without a tombstone — losing one cycle of telemetry is far
-        cheaper than spuriously declaring a key orphaned."""
+        """FAIL-CLOSED on unknown. If Jira returns 5xx / network error,
+        issue_exists() returns None and probe_for_write returns
+        WRITE_UNKNOWN. Backfill MUST skip the destructive write —
+        we don't know whether the key is alive or orphaned, and the
+        previous fail-open policy could write into a real orphan.
+        Tombstone is NOT created (we can't claim to know it's an
+        orphan). The next cycle retries.
+        """
         s, sf = self._make_sync(tmp_path)
         s.jira.issue_exists.return_value = None  # transient
         s.notion.find_toggle_by_text.return_value = None
@@ -876,9 +1030,14 @@ class TestNotionToJiraBackfillSkipsOrphan:
 
         s._backfill_templates([_notion_page("VC-200", page_id="p2")])
 
-        # No tombstone written
+        # Backfill SKIPPED — no Notion write happened.
+        assert called_with == [], (
+            "Backfill must skip on unknown Jira state, not fail-open. "
+            "Got destructive call: %r" % called_with
+        )
+        # No tombstone fabricated — we don't know it's orphaned.
         on_disk = json.loads(sf.read_text())
         assert "VC-200" not in on_disk.get("orphaned_jira_keys", {})
-        # Backfill proceeded (no tombstone to skip on)
-        assert called_with == [("p2", "VC-200")]
+        # skipped_unknown counter advanced; skipped_orphan did not.
+        assert s.stats["skipped_unknown"] == 1
         assert s.stats["skipped_orphan"] == 0

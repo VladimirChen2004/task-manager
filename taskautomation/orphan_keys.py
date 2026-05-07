@@ -145,6 +145,12 @@ class OrphanResolver:
           * True  → 200 OK, issue exists                → clear tombstone
           * False → confirmed 404                       → mark tombstone
           * None  → unknown (5xx, network, 403, etc.)   → leave state as-is
+
+        FAIL-OPEN on unknown. Use this for read-only / pure-skip
+        decisions, where False ("not currently orphaned") may safely
+        let the caller proceed. Do NOT use this in write paths — see
+        ``probe_for_write`` for the fail-closed tri-state needed when
+        a destructive write is on the line.
         """
         try:
             exists = jira.issue_exists(key)
@@ -163,3 +169,56 @@ class OrphanResolver:
             return True
         # Unknown — keep current state.
         return self.is_orphaned(key)
+
+    # Verdicts returned by ``probe_for_write``.
+    WRITE_ALIVE = "alive"
+    WRITE_ORPHANED = "orphaned"
+    WRITE_UNKNOWN = "unknown"
+
+    def probe_for_write(self, key: str, jira: Any) -> str:
+        """Probe Jira and return a verdict the caller MUST gate writes on.
+
+        FAIL-CLOSED on unknown: when Jira does not give a definitive
+        answer (5xx, 403, network, raised exception), this returns
+        ``"unknown"`` so the caller can skip the destructive write
+        for this cycle without inventing a tombstone. The next cycle
+        will retry; one lost cycle of progress is the right tradeoff
+        against silently writing into a real orphan.
+
+        Verdicts:
+          * ``"alive"``    — Jira returned 200; write is safe; any prior
+                             tombstone is cleared.
+          * ``"orphaned"`` — Jira confirmed 404; write must be skipped;
+                             tombstone is recorded for downstream phases.
+          * ``"unknown"``  — Jira state cannot be determined; write must
+                             be skipped; tombstone is NOT touched (so an
+                             existing tombstone survives, and a missing
+                             one is not invented).
+
+        Use ``probe_and_resolve`` instead when the caller is purely
+        gating a per-key sync loop (no destructive write happens before
+        the next probe).
+        """
+        try:
+            exists = jira.issue_exists(key)
+        except Exception as e:
+            log.warning(
+                "%s: orphan write-probe raised %s — verdict=unknown, "
+                "skipping write this cycle",
+                key, type(e).__name__,
+            )
+            return self.WRITE_UNKNOWN
+
+        if exists is True:
+            self.clear_orphaned(key)
+            return self.WRITE_ALIVE
+        if exists is False:
+            self.mark_orphaned(key, source="jira_404")
+            return self.WRITE_ORPHANED
+        # Unknown — DO NOT touch tombstone, DO NOT permit write.
+        log.warning(
+            "%s: Jira existence probe returned None — verdict=unknown, "
+            "skipping write this cycle (tombstone unchanged)",
+            key,
+        )
+        return self.WRITE_UNKNOWN
