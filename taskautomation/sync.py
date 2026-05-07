@@ -477,9 +477,19 @@ class NotionToJiraSync:
     def _backfill_templates(self, pages: List[Dict[str, Any]]):
         """Add missing template sections to existing pages (one-time catch-up).
 
-        Orphan policy: skip pages whose Jira key is tombstoned. Backfill
-        writes to Notion (`notion.append_children`); on an orphaned key
-        that violates "leave Notion/Confluence unchanged".
+        Orphan policy: skip pages whose Jira key has just become 404.
+        We use ``probe_and_resolve`` (not ``is_orphaned``) because
+        NotionToJiraSync runs in Phase 4 — before Subtask↔Todo (5),
+        Confluence (6), and SectionSync (7) — so on the FIRST cycle
+        when a key becomes orphaned, no tombstone exists yet. Without
+        a fresh probe, backfill could call ``_add_template_sections``
+        (which appends Notion children) on an orphaned page, violating
+        the "leave Notion/Confluence unchanged" invariant.
+
+        The probe costs one Jira GET per backfill candidate; the set
+        of candidates is bounded by the one-time `template_backfilled`
+        cache, so this is at most a one-shot extra hit per new key
+        and zero per cycle once everything is backfilled.
         """
         backfilled = self._state.get("template_backfilled", set())
         if isinstance(backfilled, list):
@@ -490,9 +500,11 @@ class NotionToJiraSync:
             if not jira_key or jira_key in backfilled:
                 continue
 
-            # Read-only orphan check — no extra Jira GET. Tombstone, if
-            # present, was set by an earlier phase this cycle.
-            if self._orphans.is_orphaned(jira_key):
+            # Probe Jira so a freshly-orphaned (and not-yet-tombstoned)
+            # key is caught here, in the first phase that would write
+            # to Notion. probe_and_resolve marks/clears the tombstone
+            # for downstream phases the same cycle.
+            if self._orphans.probe_and_resolve(jira_key, self.jira):
                 self.stats["skipped_orphan"] += 1
                 continue
 

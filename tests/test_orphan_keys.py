@@ -752,10 +752,13 @@ class TestNotionToJiraBackfillSkipsOrphan:
     def test_orphan_page_without_template_is_not_backfilled(
         self, tmp_path, monkeypatch
     ):
+        """Pre-existing tombstone case: probe still runs but keeps the
+        tombstone (Jira still 404), backfill is skipped."""
         from taskautomation.orphan_keys import OrphanResolver
         s, sf = self._make_sync(tmp_path)
         OrphanResolver(sf).mark_orphaned("VC-114", source="jira_404")
         s._orphans = OrphanResolver(sf)
+        s.jira.issue_exists.return_value = False  # 404, still orphan
 
         # Notion page lacks the MVP toggle — without orphan gate, the
         # backfill would call _add_template_sections and write blocks.
@@ -780,11 +783,58 @@ class TestNotionToJiraBackfillSkipsOrphan:
         )
         assert s.stats["skipped_orphan"] == 1
 
+    def test_first_cycle_orphan_caught_by_probe_no_append(
+        self, tmp_path, monkeypatch
+    ):
+        """Critical regression: NotionToJiraSync runs in Phase 4,
+        BEFORE the phases that normally set the tombstone (Subtask↔Todo
+        in 5, Confluence in 6, SectionSync in 7). On the first cycle
+        when a key becomes 404, no tombstone exists yet.
+
+        Without an in-phase probe, _backfill_templates would call
+        notion.append_children on the orphaned page if its MVP toggle
+        is missing — violating the orphan policy on cycle 1.
+
+        With probe_and_resolve, this phase itself catches the 404,
+        marks the tombstone (so phases 5/6/7 also skip on cycle 1),
+        and skips the destructive write.
+        """
+        s, sf = self._make_sync(tmp_path)
+        # Empty state — no tombstone for VC-114.
+        assert "VC-114" not in s._orphans._read_bucket()
+
+        s.jira.issue_exists.return_value = False  # 404, fresh orphan
+        # Page has no MVP toggle → would otherwise be backfilled.
+        s.notion.find_toggle_by_text.return_value = None
+
+        import taskautomation.sync as sync_module
+        called_with = []
+
+        def fake_add(notion, page_id, jira_key):
+            called_with.append((page_id, jira_key))
+
+        monkeypatch.setattr(
+            sync_module, "_add_template_sections", fake_add
+        )
+
+        s._backfill_templates([_notion_page("VC-114", page_id="p1")])
+
+        assert called_with == [], (
+            "First-cycle orphan was written by _add_template_sections; "
+            "probe_and_resolve must catch this before the append."
+        )
+        assert s.stats["skipped_orphan"] == 1
+        # Tombstone was just written by the probe — downstream phases
+        # in this same cycle will also skip.
+        on_disk = json.loads(sf.read_text())
+        assert "VC-114" in on_disk.get("orphaned_jira_keys", {})
+
     def test_live_page_without_template_is_backfilled(
         self, tmp_path, monkeypatch
     ):
         """Sanity: a non-orphan page still gets the template."""
         s, sf = self._make_sync(tmp_path)
+        s.jira.issue_exists.return_value = True  # 200, alive
         s.notion.find_toggle_by_text.return_value = None
 
         import taskautomation.sync as sync_module
@@ -799,5 +849,36 @@ class TestNotionToJiraBackfillSkipsOrphan:
 
         s._backfill_templates([_notion_page("VC-200", page_id="p2")])
 
+        assert called_with == [("p2", "VC-200")]
+        assert s.stats["skipped_orphan"] == 0
+
+    def test_transient_jira_failure_does_not_mark_or_skip(
+        self, tmp_path, monkeypatch
+    ):
+        """If Jira returns 5xx / network error, issue_exists() returns
+        None. probe_and_resolve must NOT mark a tombstone and must NOT
+        clear an existing one. Backfill must proceed normally for keys
+        without a tombstone — losing one cycle of telemetry is far
+        cheaper than spuriously declaring a key orphaned."""
+        s, sf = self._make_sync(tmp_path)
+        s.jira.issue_exists.return_value = None  # transient
+        s.notion.find_toggle_by_text.return_value = None
+
+        import taskautomation.sync as sync_module
+        called_with = []
+
+        def fake_add(notion, page_id, jira_key):
+            called_with.append((page_id, jira_key))
+
+        monkeypatch.setattr(
+            sync_module, "_add_template_sections", fake_add
+        )
+
+        s._backfill_templates([_notion_page("VC-200", page_id="p2")])
+
+        # No tombstone written
+        on_disk = json.loads(sf.read_text())
+        assert "VC-200" not in on_disk.get("orphaned_jira_keys", {})
+        # Backfill proceeded (no tombstone to skip on)
         assert called_with == [("p2", "VC-200")]
         assert s.stats["skipped_orphan"] == 0
