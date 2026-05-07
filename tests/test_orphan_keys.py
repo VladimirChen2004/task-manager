@@ -557,18 +557,19 @@ class TestSectionSyncIntegration:
             sync_module.STATE_FILE = original
         return s, sf
 
-    def test_pre_marked_orphan_is_skipped_without_jira_call(self, tmp_path):
+    def test_pre_marked_orphan_is_skipped(self, tmp_path):
         from taskautomation.orphan_keys import OrphanResolver
         s, sf = self._make_sync(tmp_path)
         # Pre-existing tombstone (e.g. ConfluenceSync wrote it earlier
         # this cycle).
         OrphanResolver(sf).mark_orphaned("VC-114", source="jira_404")
         s._orphans = OrphanResolver(sf)
+        # probe_and_resolve will still call issue_exists; emulate 404.
+        s.jira.issue_exists.return_value = False
 
         s.notion.query_all_pages_with_jira_key.return_value = [
             _notion_page("VC-114"),
         ]
-        # Stub _sync_task — must NOT be invoked
         s._sync_task = MagicMock()
 
         import taskautomation.sync as sync_module
@@ -577,13 +578,36 @@ class TestSectionSyncIntegration:
         s.run()
 
         s._sync_task.assert_not_called()
-        # SectionSync must NOT make its own Jira probe (read-only consult).
-        s.jira.issue_exists.assert_not_called()
         assert s.stats["skipped_orphan"] == 1
         assert s.stats["errors"] == 0
 
+    def test_orphan_skip_works_without_prior_tombstone(self, tmp_path):
+        """SectionSync must NOT depend on phase ordering. If it runs
+        first (or stand-alone) and Jira returns 404, SectionSync
+        itself marks the tombstone via probe_and_resolve and skips."""
+        s, sf = self._make_sync(tmp_path)
+        # No pre-existing tombstone.
+        s.jira.issue_exists.return_value = False  # 404
+
+        s.notion.query_all_pages_with_jira_key.return_value = [
+            _notion_page("VC-114"),
+        ]
+        s._sync_task = MagicMock()
+
+        import taskautomation.sync as sync_module
+        sync_module.time.sleep = lambda *a, **kw: None
+
+        s.run()
+
+        s._sync_task.assert_not_called()
+        assert s.stats["skipped_orphan"] == 1
+        # Tombstone is now persisted for future phases / cycles.
+        on_disk = json.loads(sf.read_text())
+        assert "VC-114" in on_disk.get("orphaned_jira_keys", {})
+
     def test_no_tombstone_lets_sync_proceed(self, tmp_path):
         s, sf = self._make_sync(tmp_path)
+        s.jira.issue_exists.return_value = True  # 200 — issue exists
         s.notion.query_all_pages_with_jira_key.return_value = [
             _notion_page("VC-200"),
         ]
@@ -692,3 +716,88 @@ class TestNotionToJiraDeletePath:
         assert s.stats["skipped_orphan"] == 0
         on_disk = json.loads(sf.read_text())
         assert "VC-114" not in on_disk.get("orphaned_jira_keys", {})
+
+
+class TestNotionToJiraBackfillSkipsOrphan:
+    """Regression for the gap surfaced by post-merge audit:
+    NotionToJiraSync._backfill_templates iterates every page with a
+    Jira Key and may call notion.append_children via
+    _add_template_sections. On an orphaned key that violates the
+    "leave Notion/Confluence unchanged" invariant of orphan policy.
+    """
+
+    def _make_sync(self, tmp_path):
+        from taskautomation import sync as sync_module
+        from taskautomation.sync import NotionToJiraSync
+        from taskautomation.orphan_keys import OrphanResolver
+        sf = make_state_file(tmp_path)
+        original = sync_module.STATE_FILE
+        sync_module.STATE_FILE = sf
+        try:
+            s = NotionToJiraSync.__new__(NotionToJiraSync)
+            s.jira = MagicMock()
+            s.notion = MagicMock()
+            s.dry_run = False
+            s.stats = {
+                "checked": 0, "updated": 0, "skipped": 0,
+                "skipped_orphan": 0, "errors": 0,
+            }
+            s._state = {"template_backfilled": []}
+            s._known = {}
+            s._orphans = OrphanResolver(sf)
+        finally:
+            sync_module.STATE_FILE = original
+        return s, sf
+
+    def test_orphan_page_without_template_is_not_backfilled(
+        self, tmp_path, monkeypatch
+    ):
+        from taskautomation.orphan_keys import OrphanResolver
+        s, sf = self._make_sync(tmp_path)
+        OrphanResolver(sf).mark_orphaned("VC-114", source="jira_404")
+        s._orphans = OrphanResolver(sf)
+
+        # Notion page lacks the MVP toggle — without orphan gate, the
+        # backfill would call _add_template_sections and write blocks.
+        s.notion.find_toggle_by_text.return_value = None
+
+        # Spy on the module-level helper that does the writes.
+        import taskautomation.sync as sync_module
+        called_with = []
+
+        def fake_add(notion, page_id, jira_key):
+            called_with.append((page_id, jira_key))
+
+        monkeypatch.setattr(
+            sync_module, "_add_template_sections", fake_add
+        )
+
+        s._backfill_templates([_notion_page("VC-114", page_id="p1")])
+
+        assert called_with == [], (
+            f"_add_template_sections must not run for orphaned key, "
+            f"but was called with {called_with!r}"
+        )
+        assert s.stats["skipped_orphan"] == 1
+
+    def test_live_page_without_template_is_backfilled(
+        self, tmp_path, monkeypatch
+    ):
+        """Sanity: a non-orphan page still gets the template."""
+        s, sf = self._make_sync(tmp_path)
+        s.notion.find_toggle_by_text.return_value = None
+
+        import taskautomation.sync as sync_module
+        called_with = []
+
+        def fake_add(notion, page_id, jira_key):
+            called_with.append((page_id, jira_key))
+
+        monkeypatch.setattr(
+            sync_module, "_add_template_sections", fake_add
+        )
+
+        s._backfill_templates([_notion_page("VC-200", page_id="p2")])
+
+        assert called_with == [("p2", "VC-200")]
+        assert s.stats["skipped_orphan"] == 0

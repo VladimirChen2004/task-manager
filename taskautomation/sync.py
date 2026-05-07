@@ -475,7 +475,12 @@ class NotionToJiraSync:
         self._log_stats()
 
     def _backfill_templates(self, pages: List[Dict[str, Any]]):
-        """Add missing template sections to existing pages (one-time catch-up)."""
+        """Add missing template sections to existing pages (one-time catch-up).
+
+        Orphan policy: skip pages whose Jira key is tombstoned. Backfill
+        writes to Notion (`notion.append_children`); on an orphaned key
+        that violates "leave Notion/Confluence unchanged".
+        """
         backfilled = self._state.get("template_backfilled", set())
         if isinstance(backfilled, list):
             backfilled = set(backfilled)
@@ -483,6 +488,12 @@ class NotionToJiraSync:
         for page in pages:
             jira_key = NotionClient.get_jira_key(page)
             if not jira_key or jira_key in backfilled:
+                continue
+
+            # Read-only orphan check — no extra Jira GET. Tombstone, if
+            # present, was set by an earlier phase this cycle.
+            if self._orphans.is_orphaned(jira_key):
+                self.stats["skipped_orphan"] += 1
                 continue
 
             page_id = page["id"]
@@ -2370,12 +2381,13 @@ class SectionSync:
                 continue
             self.stats["checked"] += 1
 
-            # SectionSync doesn't touch Jira directly, so we don't probe
-            # here — we only consult the existing tombstone written by
-            # earlier phases this cycle. If somehow this phase runs
-            # first and the tombstone isn't there yet, we proceed
-            # normally; the next cycle will catch up.
-            if self._orphans.is_orphaned(jira_key):
+            # SectionSync runs last in the daemon cycle today, so a
+            # tombstone written by SubtaskTodoSync / ConfluenceSync
+            # would already be visible. We still call probe_and_resolve
+            # here (one Jira GET per orphan) so SectionSync stays
+            # correct regardless of phase ordering — the daemon could
+            # in principle reorder phases or run SectionSync standalone.
+            if self._orphans.probe_and_resolve(jira_key, self.jira):
                 self.stats["skipped_orphan"] += 1
                 continue
 
