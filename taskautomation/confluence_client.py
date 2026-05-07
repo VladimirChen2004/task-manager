@@ -37,24 +37,40 @@ class ConfluenceClient:
 
     _RETRYABLE_STATUS = {429, 502, 503, 504}
     _MAX_RETRIES = 4
+    _SAFE_METHODS = {"get", "head", "options"}
 
-    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+    def _request(self, method: str, url: str,
+                 idempotent: Optional[bool] = None,
+                 **kwargs) -> requests.Response:
         """HTTP request with retry on transient errors.
 
-        Retries on: 429 (rate limit), 502/503/504 (server errors),
-        Timeout, ConnectionError. Uses exponential backoff with jitter.
+        Retry policy:
+          - 429 — always retried (server explicitly rejected; respects Retry-After).
+          - 502/503/504, Timeout, ConnectionError — retried ONLY when
+            idempotent.
+          - Any other status — returned as-is.
+
+        ``idempotent`` defaults to True for GET/HEAD/OPTIONS, False for
+        POST/PATCH/PUT/DELETE — caller must opt in explicitly with
+        ``idempotent=True`` for safe write endpoints (e.g. PUT-by-id
+        with absolute payload, conditional PUT with version).
         """
         import random
         import time as _time
+        if idempotent is None:
+            idempotent = method.lower() in self._SAFE_METHODS
         kwargs.setdefault("timeout", 30)
         kwargs.setdefault("headers", {"Content-Type": "application/json"})
         last_exc = None
+        resp = None
 
         for attempt in range(self._MAX_RETRIES):
             try:
                 resp = getattr(requests, method)(url, auth=self._auth, **kwargs)
             except (requests.exceptions.Timeout,
                     requests.exceptions.ConnectionError) as e:
+                if not idempotent:
+                    raise
                 last_exc = e
                 delay = min(2 ** attempt + random.uniform(0, 1), 30)
                 log.warning(
@@ -66,6 +82,9 @@ class ConfluenceClient:
                 continue
 
             if resp.status_code not in self._RETRYABLE_STATUS:
+                return resp
+
+            if not idempotent and resp.status_code != 429:
                 return resp
 
             if resp.status_code == 429:
@@ -140,7 +159,9 @@ class ConfluenceClient:
         if pid:
             payload["ancestors"] = [{"id": int(pid)}]
 
-        resp = self._request("post", url, json=payload)
+        # CREATE — not idempotent. Retrying after timeout/5xx could
+        # duplicate the page since the server may have already created it.
+        resp = self._request("post", url, json=payload, idempotent=False)
         if resp.status_code == 200:
             data = resp.json()
             log.info("Created Confluence page: %s (id=%s)", title, data.get("id"))
@@ -165,12 +186,22 @@ class ConfluenceClient:
                      jira_key, existing.get("id"))
             return existing
 
-        # Try to create
-        page = self.create_page(title, body_html)
+        # Try to create. create_page is non-idempotent — on network or
+        # 5xx errors the server may have processed the request anyway,
+        # so we always re-probe by jira_key after any failure.
+        try:
+            page = self.create_page(title, body_html)
+        except (requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError) as e:
+            log.warning("create_page raised %s for %s — re-probing by jira_key",
+                        type(e).__name__, jira_key)
+            page = None
+
         if page:
             return page
 
-        # If creation failed (title conflict from Jira Automation race), try find again
+        # Creation failed or returned None — check if a page exists now
+        # (Jira Automation race OR server processed our failed request).
         existing = self.find_page_by_jira_key(jira_key)
         if existing:
             log.info("Found page after create conflict for %s — returning as-is", jira_key)
@@ -198,7 +229,10 @@ class ConfluenceClient:
             },
             "version": {"number": version + 1},
         }
-        resp = self._request("put", url, json=payload)
+        # PUT with explicit version is conditional — a retry after a
+        # successful first attempt fails with 409 Conflict, never
+        # duplicates content. Safe to retry on 5xx/network.
+        resp = self._request("put", url, json=payload, idempotent=True)
         if resp.status_code == 200:
             return True
         log.error("Failed to update page %s: %s %s", page_id, resp.status_code, resp.text[:300])

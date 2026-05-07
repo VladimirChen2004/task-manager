@@ -96,7 +96,27 @@ cp .env.example .env
 
 **Важно:** после `discover-statuses` проверить что маппинг в `jira_vchen.py` (`JIRA_TO_NOTION_STATUS`) соответствует реальным статусам VCHEN. Если статусы отличаются — скорректировать словарь.
 
-## 6. Настройка sync на сервере (cron)
+## 6. Operational notes
+
+### venv и работающий демон
+
+**Никогда не пересоздавайте venv (`rm -rf venv && python3 -m venv venv`) пока демон запущен.**
+
+Демон держит файловые дескрипторы на `.so`-файлы из `venv/lib/`. Удаление venv под работающим процессом приводит к:
+- `ImportError` / `ModuleNotFoundError` при следующем импорте
+- Segfault при обращении к удалённым `.so`
+- TLS-ошибки (`CERTIFICATE_VERIFY_FAILED`) если новый Python использует другой SSL-бэкенд
+
+**Правильный порядок:**
+1. Остановить демон: `~/automations/stop-all.sh` (или `tmux kill-session -t task-sync`)
+2. Пересоздать venv: `rm -rf venv && python3 -m venv venv && pip install -r requirements.txt`
+3. Запустить демон: `~/automations/start-all.sh`
+
+### TLS / SSL
+
+`requirements.txt` пинит `urllib3<2` — это предотвращает конфликт между LibreSSL (macOS system Python) и urllib3 v2, который требует OpenSSL 1.1.1+. Если переходите на Homebrew Python с OpenSSL — можно убрать этот pin.
+
+## 7. Настройка sync на сервере (cron)
 
 ```bash
 # На сервере: добавить env vars

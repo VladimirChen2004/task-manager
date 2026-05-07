@@ -50,12 +50,32 @@ class JiraVCHEN:
     _RETRYABLE_STATUS = {429, 502, 503, 504}
     _MAX_RETRIES = 4
 
-    def _request(self, method: str, url: str, **kwargs) -> http_requests.Response:
-        """HTTP request with retry on transient errors."""
+    _SAFE_METHODS = {"get", "head", "options"}
+
+    def _request(self, method: str, url: str,
+                 idempotent: Optional[bool] = None,
+                 **kwargs) -> http_requests.Response:
+        """HTTP request with retry on transient errors.
+
+        Retry policy:
+          - 429 — always retried, respects Retry-After.
+          - 502/503/504, Timeout, ConnectionError — retried ONLY when
+            idempotent.
+          - Other statuses — returned as-is.
+
+        ``idempotent`` defaults to True for GET/HEAD/OPTIONS, False for
+        POST/PATCH/PUT/DELETE. Callers must explicitly pass
+        ``idempotent=True`` for safe write endpoints (PUT-by-key with
+        absolute payload, DELETE-by-key, etc.). Create endpoints leave
+        the default to avoid duplicates.
+        """
         import random
         import time as _time
+        if idempotent is None:
+            idempotent = method.lower() in self._SAFE_METHODS
         kwargs.setdefault("timeout", 30)
         last_exc = None
+        resp = None
 
         for attempt in range(self._MAX_RETRIES):
             try:
@@ -64,6 +84,8 @@ class JiraVCHEN:
                 )
             except (http_requests.exceptions.Timeout,
                     http_requests.exceptions.ConnectionError) as e:
+                if not idempotent:
+                    raise
                 last_exc = e
                 delay = min(2 ** attempt + random.uniform(0, 1), 30)
                 import logging
@@ -76,6 +98,9 @@ class JiraVCHEN:
                 continue
 
             if resp.status_code not in self._RETRYABLE_STATUS:
+                return resp
+
+            if not idempotent and resp.status_code != 429:
                 return resp
 
             if resp.status_code == 429:
@@ -262,7 +287,10 @@ class JiraVCHEN:
             payload["fields"]["duedate"] = due_date
 
         url = f"{self.server}/rest/api/3/issue"
+        # CREATE issue — not idempotent. Retry after timeout/5xx could
+        # duplicate the issue.
         resp = self._request("post", url, json=payload,
+                             idempotent=False,
                              headers={"Content-Type": "application/json"})
         resp.raise_for_status()
         data = resp.json()
@@ -322,7 +350,10 @@ class JiraVCHEN:
                 }
 
             url = f"{self.server}/rest/api/3/issue"
+            # CREATE subtask — not idempotent. Retry after timeout/5xx
+            # could duplicate the subtask.
             resp = self._request("post", url, json=payload,
+                                 idempotent=False,
                                  headers={"Content-Type": "application/json"})
             resp.raise_for_status()
             data = resp.json()
@@ -336,14 +367,21 @@ class JiraVCHEN:
         return results
 
     def _link_issues(self, parent_key: str, child_key: str) -> bool:
-        """Create 'Relates' link between two issues."""
+        """Create 'Relates' link between two issues.
+
+        WARNING: issueLink is NOT idempotent — Jira will silently create
+        a duplicate 'Relates' link on retry. Use default policy (no
+        retry on 5xx/network) and accept that one network blip leaves
+        the link missing; the next sync cycle will detect and recreate.
+        """
         payload = {
             "type": {"name": "Relates"},
             "inwardIssue": {"key": parent_key},
             "outwardIssue": {"key": child_key},
         }
+        # Default policy — non-idempotent.
         resp = self._request("post", f"{self.server}/rest/api/3/issueLink",
-                             json=payload,
+                             json=payload, idempotent=False,
                              headers={"Content-Type": "application/json"})
         return resp.status_code in (200, 201)
 
@@ -358,7 +396,8 @@ class JiraVCHEN:
         adf = self._build_adf_description(description, notion_url, confluence_url)
         url = f"{self.server}/rest/api/3/issue/{issue_key}"
         payload = {"fields": {"description": adf}}
-        resp = self._request("put", url, json=payload,
+        # PUT issue-by-key with absolute fields — idempotent.
+        resp = self._request("put", url, json=payload, idempotent=True,
                              headers={"Content-Type": "application/json"})
         return resp.status_code in (200, 204)
 
@@ -501,14 +540,17 @@ class JiraVCHEN:
         """Rename a Jira issue (update summary)."""
         url = f"{self.server}/rest/api/3/issue/{issue_key}"
         payload = {"fields": {"summary": new_summary}}
-        resp = self._request("put", url, json=payload,
+        # PUT issue-by-key with absolute summary — idempotent.
+        resp = self._request("put", url, json=payload, idempotent=True,
                              headers={"Content-Type": "application/json"})
         return resp.status_code in (200, 204)
 
     def delete_issue(self, issue_key: str) -> bool:
         """Delete a Jira issue (subtask or linked task)."""
         url = f"{self.server}/rest/api/3/issue/{issue_key}"
-        resp = self._request("delete", url)
+        # DELETE-by-key — idempotent (re-deleting returns 404 but desired
+        # end state is reached).
+        resp = self._request("delete", url, idempotent=True)
         return resp.status_code in (200, 204)
 
     # ---- Custom Fields ----
@@ -543,7 +585,8 @@ class JiraVCHEN:
         )
         url = f"{self.server}/rest/api/3/issue/{issue_key}"
         payload = {"fields": {self.PROGRESS_FIELD: bar}}
-        resp = self._request("put", url, json=payload,
+        # PUT issue-by-key with absolute field — idempotent.
+        resp = self._request("put", url, json=payload, idempotent=True,
                              headers={"Content-Type": "application/json"})
         return resp.status_code in (200, 204)
 
@@ -551,7 +594,8 @@ class JiraVCHEN:
         """Update 'Confluence URL' field."""
         url = f"{self.server}/rest/api/3/issue/{issue_key}"
         payload = {"fields": {self.CONFLUENCE_URL_FIELD: confluence_url}}
-        resp = self._request("put", url, json=payload,
+        # PUT issue-by-key with absolute field — idempotent.
+        resp = self._request("put", url, json=payload, idempotent=True,
                              headers={"Content-Type": "application/json"})
         return resp.status_code in (200, 204)
 

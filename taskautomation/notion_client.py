@@ -35,17 +35,36 @@ class NotionClient:
 
     _RETRYABLE_STATUS = {429, 502, 503, 504}
     _MAX_RETRIES = 4
+    _SAFE_METHODS = {"get", "head", "options"}
 
-    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+    def _request(self, method: str, url: str,
+                 idempotent: Optional[bool] = None,
+                 **kwargs) -> requests.Response:
         """HTTP request with retry on transient errors.
 
-        Retries on: 429 (rate limit), 502/503/504 (server errors),
-        Timeout, ConnectionError. Uses exponential backoff with jitter.
-        Respects Retry-After header.
+        Retry policy:
+          - 429 (Too Many Requests) — always retried (server explicitly
+            said the request was NOT processed). Respects Retry-After.
+          - 502/503/504, Timeout, ConnectionError — retried ONLY when
+            the call is idempotent (outcome of a retry is safe).
+          - Any other status — returned as-is (no retry).
+
+        ``idempotent`` defaults:
+          - True for GET/HEAD/OPTIONS (safe by HTTP semantics).
+          - False for POST/PATCH/PUT/DELETE — caller must opt in with
+            ``idempotent=True`` only when they know the endpoint is safe
+            to repeat (e.g. PATCH a known property by id, DELETE a known
+            block by id). For CREATE / append endpoints leave default.
+
+        On exhausted retries returns the last response (or re-raises the
+        last network exception when no response was ever obtained).
         """
         import random
+        if idempotent is None:
+            idempotent = method.lower() in self._SAFE_METHODS
         kwargs.setdefault("timeout", 30)
         last_exc = None
+        resp = None
 
         for attempt in range(self._MAX_RETRIES):
             try:
@@ -54,6 +73,10 @@ class NotionClient:
                 )
             except (requests.exceptions.Timeout,
                     requests.exceptions.ConnectionError) as e:
+                if not idempotent:
+                    # Outcome unknown — server may have processed it.
+                    # Re-raise so caller can probe state and reconcile.
+                    raise
                 last_exc = e
                 delay = min(2 ** attempt + random.uniform(0, 1), 30)
                 log.warning(
@@ -67,7 +90,10 @@ class NotionClient:
             if resp.status_code not in self._RETRYABLE_STATUS:
                 return resp
 
-            # Retryable HTTP status
+            # For non-idempotent calls, only 429 is safe to retry.
+            if not idempotent and resp.status_code != 429:
+                return resp
+
             if resp.status_code == 429:
                 delay = float(resp.headers.get("Retry-After", 2 ** attempt))
             else:
@@ -79,7 +105,6 @@ class NotionClient:
             )
             time.sleep(delay)
 
-        # Exhausted retries — return last response or raise last exception
         if last_exc is not None:
             raise last_exc
         return resp
@@ -97,7 +122,8 @@ class NotionClient:
             "page_size": 1,
         }
 
-        resp = self._request("post", url, json=payload)
+        # Database query is a POST-as-GET — idempotent.
+        resp = self._request("post", url, json=payload, idempotent=True)
         resp.raise_for_status()
         results = resp.json().get("results", [])
         return results[0] if results else None
@@ -120,7 +146,8 @@ class NotionClient:
             if start_cursor:
                 payload["start_cursor"] = start_cursor
 
-            resp = self._request("post", url, json=payload)
+            # Database query is a POST-as-GET — idempotent.
+            resp = self._request("post", url, json=payload, idempotent=True)
             resp.raise_for_status()
             data = resp.json()
             all_pages.extend(data.get("results", []))
@@ -192,7 +219,8 @@ class NotionClient:
             if start_cursor:
                 payload["start_cursor"] = start_cursor
 
-            resp = self._request("post", url, json=payload)
+            # Database query is a POST-as-GET — idempotent.
+            resp = self._request("post", url, json=payload, idempotent=True)
             resp.raise_for_status()
             data = resp.json()
             all_pages.extend(data.get("results", []))
@@ -215,7 +243,8 @@ class NotionClient:
         url = f"{self.API_URL}/pages/{page_id}"
         payload = {"properties": properties}
 
-        resp = self._request("patch", url, json=payload)
+        # PATCH page-by-id with absolute property values — idempotent.
+        resp = self._request("patch", url, json=payload, idempotent=True)
         if resp.status_code == 200:
             return True
         log.error(
@@ -238,7 +267,8 @@ class NotionClient:
                 }
             }
         }
-        resp = self._request("patch", url, json=payload)
+        # PATCH page-by-id — idempotent.
+        resp = self._request("patch", url, json=payload, idempotent=True)
         if resp.status_code == 200:
             return True
         log.error(
@@ -287,7 +317,8 @@ class NotionClient:
         if children:
             payload["children"] = children
 
-        resp = self._request("post", url, json=payload)
+        # CREATE endpoint — not idempotent, retry would risk duplicates.
+        resp = self._request("post", url, json=payload, idempotent=False)
         if resp.status_code == 200:
             return resp.json()
         log.error(
@@ -391,7 +422,8 @@ class NotionClient:
         url = f"{self.API_URL}/blocks/{block_id}"
         payload = {block_type: {"rich_text": rich_text}}
 
-        resp = self._request("patch", url, json=payload)
+        # PATCH block-by-id with absolute rich_text — idempotent.
+        resp = self._request("patch", url, json=payload, idempotent=True)
         if resp.status_code == 200:
             return True
         log.error(
@@ -423,10 +455,18 @@ class NotionClient:
     def append_children(
         self, block_id: str, children: List[Dict[str, Any]]
     ) -> bool:
-        """Append child blocks to a parent block."""
+        """Append child blocks to a parent block.
+
+        WARNING: append is NOT idempotent — retrying after a timeout/5xx
+        could duplicate the appended blocks. We rely on the default
+        retry policy (POST/PATCH default ``idempotent=False``) to skip
+        retries on 5xx and network errors.
+        """
         url = f"{self.API_URL}/blocks/{block_id}/children"
         payload = {"children": children}
 
+        # Default policy: PATCH is non-idempotent. Network/5xx errors
+        # are NOT retried to avoid duplicate blocks.
         resp = self._request("patch", url, json=payload)
         if resp.status_code == 200:
             return True
@@ -441,7 +481,9 @@ class NotionClient:
     def delete_block(self, block_id: str) -> bool:
         """Delete a block."""
         url = f"{self.API_URL}/blocks/{block_id}"
-        resp = self._request("delete", url)
+        # DELETE-by-id is idempotent (deleting an already-deleted block returns 404,
+        # but the desired end state is reached either way).
+        resp = self._request("delete", url, idempotent=True)
         return resp.status_code == 200
 
     # ---- Section content API ----
@@ -551,7 +593,8 @@ class NotionClient:
         """Update the checked state of a to_do block."""
         url = f"{self.API_URL}/blocks/{block_id}"
         payload = {"to_do": {"checked": checked}}
-        resp = self._request("patch", url, json=payload)
+        # PATCH block-by-id with absolute checked value — idempotent.
+        resp = self._request("patch", url, json=payload, idempotent=True)
         if resp.status_code == 200:
             return True
         log.error(
@@ -566,6 +609,9 @@ class NotionClient:
         """Create a to_do block inside a parent (toggle heading).
 
         Returns: block_id of created block, or None.
+
+        WARNING: append children is NOT idempotent. Default retry policy
+        (POST/PATCH default ``idempotent=False``) skips 5xx/network retries.
         """
         children = [
             {
@@ -580,6 +626,7 @@ class NotionClient:
             }
         ]
         url = f"{self.API_URL}/blocks/{parent_id}/children"
+        # Default policy — non-idempotent append.
         resp = self._request("patch", url, json={"children": children})
         if resp.status_code == 200:
             results = resp.json().get("results", [])

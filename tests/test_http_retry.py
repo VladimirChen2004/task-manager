@@ -164,3 +164,154 @@ class TestNotionRetry:
 
         assert result.status_code == 400
         assert mock_requests.get.call_count == 1
+
+
+class TestNotionIdempotency:
+    """Non-idempotent calls (default for POST/PATCH/PUT/DELETE) must NOT
+    retry on 5xx or network errors — the server may have processed the
+    first attempt, and retrying could duplicate objects (Jira issues,
+    Notion blocks, Confluence pages).
+    """
+
+    @patch("time.sleep")
+    @patch("taskautomation.notion_client.requests")
+    def test_post_default_is_not_idempotent_5xx_returns_immediately(
+        self, mock_requests, mock_sleep
+    ):
+        """POST without explicit idempotent=True must NOT retry on 502."""
+        client = make_notion_client()
+        r502 = make_mock_response(502)
+        mock_requests.post.side_effect = [r502]
+
+        result = client._request("post", "https://api.notion.com/v1/pages",
+                                 json={})
+
+        assert result.status_code == 502
+        assert mock_requests.post.call_count == 1
+        mock_sleep.assert_not_called()
+
+    @patch("time.sleep")
+    @patch("taskautomation.notion_client.requests")
+    def test_post_explicit_non_idempotent_timeout_raises_immediately(
+        self, mock_requests, mock_sleep
+    ):
+        """idempotent=False on Timeout must re-raise without retry —
+        outcome unknown, caller must reconcile state."""
+        import requests
+        client = make_notion_client()
+        mock_requests.exceptions = requests.exceptions
+        mock_requests.post.side_effect = [
+            requests.exceptions.Timeout("read timed out")
+        ]
+
+        with pytest.raises(requests.exceptions.Timeout):
+            client._request("post", "https://api.notion.com/v1/pages",
+                            json={}, idempotent=False)
+
+        assert mock_requests.post.call_count == 1
+        mock_sleep.assert_not_called()
+
+    @patch("time.sleep")
+    @patch("taskautomation.notion_client.requests")
+    def test_post_explicit_non_idempotent_5xx_returns_immediately(
+        self, mock_requests, mock_sleep
+    ):
+        """idempotent=False on 503 must NOT retry — server may have
+        already created the object."""
+        client = make_notion_client()
+        r503 = make_mock_response(503)
+        mock_requests.post.side_effect = [r503]
+
+        result = client._request("post", "https://api.notion.com/v1/pages",
+                                 json={}, idempotent=False)
+
+        assert result.status_code == 503
+        assert mock_requests.post.call_count == 1
+        mock_sleep.assert_not_called()
+
+    @patch("time.sleep")
+    @patch("taskautomation.notion_client.requests")
+    def test_post_non_idempotent_429_still_retried(
+        self, mock_requests, mock_sleep
+    ):
+        """429 means server REJECTED the request — safe to retry even
+        for non-idempotent calls."""
+        client = make_notion_client()
+        r429 = make_mock_response(429, headers={"Retry-After": "1"})
+        r200 = make_mock_response(200)
+        mock_requests.post.side_effect = [r429, r200]
+
+        result = client._request("post", "https://api.notion.com/v1/pages",
+                                 json={}, idempotent=False)
+
+        assert result.status_code == 200
+        assert mock_requests.post.call_count == 2
+
+    @patch("time.sleep")
+    @patch("taskautomation.notion_client.requests")
+    def test_post_explicit_idempotent_true_retries_5xx(
+        self, mock_requests, mock_sleep
+    ):
+        """POST flagged as idempotent (e.g. database query) DOES retry on 5xx."""
+        client = make_notion_client()
+        r502 = make_mock_response(502)
+        r200 = make_mock_response(200, {"results": []})
+        mock_requests.post.side_effect = [r502, r200]
+
+        result = client._request("post",
+                                 "https://api.notion.com/v1/databases/x/query",
+                                 json={}, idempotent=True)
+
+        assert result.status_code == 200
+        assert mock_requests.post.call_count == 2
+
+    @patch("time.sleep")
+    @patch("taskautomation.notion_client.requests")
+    def test_patch_default_is_not_idempotent(
+        self, mock_requests, mock_sleep
+    ):
+        """PATCH without explicit idempotent=True must NOT retry on 502
+        (e.g. /blocks/{id}/children append could duplicate blocks)."""
+        client = make_notion_client()
+        r502 = make_mock_response(502)
+        mock_requests.patch.side_effect = [r502]
+
+        result = client._request("patch",
+                                 "https://api.notion.com/v1/blocks/x/children",
+                                 json={"children": []})
+
+        assert result.status_code == 502
+        assert mock_requests.patch.call_count == 1
+
+    @patch("time.sleep")
+    @patch("taskautomation.notion_client.requests")
+    def test_get_default_is_idempotent(self, mock_requests, mock_sleep):
+        """GET defaults to idempotent — must retry on 502."""
+        client = make_notion_client()
+        r502 = make_mock_response(502)
+        r200 = make_mock_response(200)
+        mock_requests.get.side_effect = [r502, r200]
+
+        result = client._request("get", "https://api.notion.com/v1/blocks/x")
+
+        assert result.status_code == 200
+        assert mock_requests.get.call_count == 2
+
+    @patch("time.sleep")
+    @patch("taskautomation.notion_client.requests")
+    def test_get_default_idempotent_retries_timeout(
+        self, mock_requests, mock_sleep
+    ):
+        """GET defaults to idempotent — Timeout is retried."""
+        import requests
+        client = make_notion_client()
+        mock_requests.exceptions = requests.exceptions
+        mock_requests.get.side_effect = [
+            requests.exceptions.Timeout("read timed out"),
+            make_mock_response(200),
+        ]
+
+        result = client._request("get", "https://api.notion.com/v1/blocks/x")
+
+        assert result.status_code == 200
+        assert mock_requests.get.call_count == 2
