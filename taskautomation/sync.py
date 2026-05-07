@@ -127,7 +127,12 @@ class BidirectionalSync:
                 self._known_priorities[k] = {"notion": v, "jira": v}
 
     def run_full(self):
-        """Full bidirectional sync: all active Jira issues."""
+        """Full bidirectional sync: all active Jira issues.
+
+        Note: orphan-key handling is not needed here. The list of
+        issues comes FROM Jira (``get_all_active``), so a deleted
+        issue cannot enter this loop in the first place.
+        """
         log.info("Bidirectional sync: all active issues")
         issues = self.jira.get_all_active()
         log.info("Found %d active issues", len(issues))
@@ -429,9 +434,11 @@ class NotionToJiraSync:
         self.jira = jira
         self.notion = notion
         self.dry_run = dry_run
-        self.stats = {"checked": 0, "updated": 0, "skipped": 0, "errors": 0}
+        self.stats = {"checked": 0, "updated": 0, "skipped": 0,
+                      "skipped_orphan": 0, "errors": 0}
         self._state = _load_state()
         self._known = self._state.get("known_notion_statuses", {})
+        self._orphans = OrphanResolver(STATE_FILE)
 
     def run(self):
         """Query all Notion pages — detect deletions, update known statuses."""
@@ -517,13 +524,47 @@ class NotionToJiraSync:
                 )
                 continue
 
-            # Missing for 2+ cycles — delete from Jira entirely
+            # Missing for 2+ cycles — delete from Jira entirely.
+            # First check the orphan tombstone: if Jira already lost the
+            # issue (e.g. user deleted it manually), there's nothing to
+            # delete — skip with a WARNING and clean local bookkeeping.
+            if self._orphans.is_orphaned(jira_key):
+                log.warning(
+                    "%s: Notion page gone and Jira issue is already "
+                    "orphaned — nothing to delete; cleaning local state",
+                    jira_key,
+                )
+                self.stats["skipped_orphan"] += 1
+                self._known.pop(jira_key, None)
+                missing.pop(jira_key, None)
+                continue
+
             if self.dry_run:
                 log.info(
                     "[DRY-RUN] %s: would delete from Jira (page deleted from Notion)",
                     jira_key,
                 )
             else:
+                # Probe Jira directly — only call delete_issue if the
+                # issue truly exists. issue_exists() returns:
+                #   True  → call delete_issue
+                #   False → already gone; mark orphan, clean local state
+                #   None  → unknown (transient); skip this cycle, retry later
+                exists = self.jira.issue_exists(jira_key)
+                if exists is False:
+                    self._orphans.mark_orphaned(jira_key, source="jira_404")
+                    self.stats["skipped_orphan"] += 1
+                    self._known.pop(jira_key, None)
+                    missing.pop(jira_key, None)
+                    continue
+                if exists is None:
+                    log.warning(
+                        "%s: Jira existence probe returned None "
+                        "(transient); will retry next cycle",
+                        jira_key,
+                    )
+                    continue
+
                 success = self.jira.delete_issue(jira_key)
                 if success:
                     log.info(
@@ -553,10 +594,12 @@ class NotionToJiraSync:
     def _log_stats(self):
         s = self.stats
         log.info(
-            "Notion→Jira: checked=%d, updated=%d, skipped=%d, errors=%d",
+            "Notion→Jira: checked=%d, updated=%d, skipped=%d, "
+            "skipped_orphan=%d, errors=%d",
             s["checked"],
             s["updated"],
             s["skipped"],
+            s.get("skipped_orphan", 0),
             s["errors"],
         )
 
@@ -861,6 +904,11 @@ class JiraToNotionCreator:
         self.stats = {"checked": 0, "created": 0, "skipped": 0, "errors": 0}
 
     def run(self):
+        # Note: orphan-key handling is not needed here. The new-issue
+        # candidate list comes FROM Jira (``get_all_active``), so a
+        # deleted issue can never become a new Notion page. Existing
+        # Notion pages are only used to filter OUT keys we already
+        # have; they never trigger a Jira fetch by orphaned key.
         log.info("Jira→Notion creation: checking for issues without Notion pages")
         existing_pages = self.notion.query_all_pages_with_jira_key()
         known_keys = set()
@@ -2296,10 +2344,11 @@ class SectionSync:
         self.dry_run = dry_run
         self.stats = {
             "checked": 0, "notion_to_conf": 0, "conf_to_notion": 0,
-            "conflicts": 0, "skipped": 0, "errors": 0,
+            "conflicts": 0, "skipped": 0, "skipped_orphan": 0, "errors": 0,
         }
         self._state = _load_state()
         self._section_state: Dict[str, Any] = self._state.get("section_sync", {})
+        self._orphans = OrphanResolver(STATE_FILE)
 
     def run(self):
         from .content_converter import (
@@ -2320,6 +2369,16 @@ class SectionSync:
             if not jira_key:
                 continue
             self.stats["checked"] += 1
+
+            # SectionSync doesn't touch Jira directly, so we don't probe
+            # here — we only consult the existing tombstone written by
+            # earlier phases this cycle. If somehow this phase runs
+            # first and the tombstone isn't there yet, we proceed
+            # normally; the next cycle will catch up.
+            if self._orphans.is_orphaned(jira_key):
+                self.stats["skipped_orphan"] += 1
+                continue
+
             try:
                 self._sync_task(page, jira_key)
             except Exception as e:
@@ -2456,9 +2515,11 @@ class SectionSync:
     def _log_stats(self):
         s = self.stats
         log.info(
-            "SectionSync: checked=%d, N→C=%d, C→N=%d, conflicts=%d, skipped=%d, errors=%d",
+            "SectionSync: checked=%d, N→C=%d, C→N=%d, conflicts=%d, "
+            "skipped=%d, skipped_orphan=%d, errors=%d",
             s["checked"], s["notion_to_conf"], s["conf_to_notion"],
-            s["conflicts"], s["skipped"], s["errors"],
+            s["conflicts"], s["skipped"],
+            s.get("skipped_orphan", 0), s["errors"],
         )
 
 

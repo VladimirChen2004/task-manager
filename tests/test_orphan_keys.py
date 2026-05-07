@@ -437,3 +437,258 @@ class TestConfluenceSyncIntegration:
         cs._sync_page.assert_called_once()
         assert cs.stats["skipped_orphan"] == 0
         assert cs.stats["errors"] == 0
+
+
+def _notion_page(jira_key: str, page_id: str = "p1") -> dict:
+    """Helper: build a minimal Notion page dict carrying a Jira Key."""
+    return {
+        "id": page_id,
+        "properties": {
+            "Jira Key": {
+                "rich_text": [{
+                    "type": "text",
+                    "text": {"content": jira_key},
+                    "plain_text": jira_key,
+                }],
+            },
+        },
+    }
+
+
+class TestSubtaskTodoSyncIntegration:
+    """SubtaskTodoSync.run() must skip orphaned keys before any Jira
+    fetch — no `get_subtask_details`, no Notion to-do read, no error.
+    Mirrors the ConfluenceSync integration suite."""
+
+    def _make_sync(self, tmp_path):
+        from taskautomation import sync as sync_module
+        from taskautomation.sync import SubtaskTodoSync
+        from taskautomation.orphan_keys import OrphanResolver
+        sf = make_state_file(tmp_path)
+        original = sync_module.STATE_FILE
+        sync_module.STATE_FILE = sf
+        try:
+            s = SubtaskTodoSync.__new__(SubtaskTodoSync)
+            s.jira = MagicMock()
+            s.notion = MagicMock()
+            s.confluence = MagicMock()
+            s.dry_run = False
+            s.stats = {
+                "pages_checked": 0, "todos_synced": 0,
+                "subtasks_created": 0, "subtasks_deleted": 0,
+                "todos_created": 0, "checked_updated": 0,
+                "skipped_orphan": 0, "errors": 0,
+            }
+            s._state = {}
+            s._known = {}
+            s._orphans = OrphanResolver(sf)
+        finally:
+            sync_module.STATE_FILE = original
+        return s, sf
+
+    def test_404_key_is_skipped_no_jira_fetch(self, tmp_path):
+        s, sf = self._make_sync(tmp_path)
+        s.notion.query_all_pages_with_jira_key.return_value = [
+            _notion_page("VC-114"),
+        ]
+        s.jira.issue_exists.return_value = False
+
+        import taskautomation.sync as sync_module
+        sync_module.time.sleep = lambda *a, **kw: None
+
+        s.run()
+
+        s.jira.issue_exists.assert_called_once_with("VC-114")
+        s.jira.get_subtask_details.assert_not_called()
+        s.notion.get_todo_children.assert_not_called()
+        assert s.stats["skipped_orphan"] == 1
+        assert s.stats["errors"] == 0
+        on_disk = json.loads(sf.read_text())
+        assert "VC-114" in on_disk.get("orphaned_jira_keys", {})
+
+    def test_save_does_not_clobber_orphan_bucket(self, tmp_path):
+        """Regression: SubtaskTodoSync._save() must use read-modify-
+        write so it doesn't erase tombstones written mid-cycle."""
+        s, sf = self._make_sync(tmp_path)
+        s.notion.query_all_pages_with_jira_key.return_value = [
+            _notion_page("VC-114"),
+        ]
+        s.jira.issue_exists.return_value = False
+
+        import taskautomation.sync as sync_module
+        sync_module.time.sleep = lambda *a, **kw: None
+
+        s.run()
+
+        on_disk = json.loads(sf.read_text())
+        assert "VC-114" in on_disk.get("orphaned_jira_keys", {}), (
+            "SubtaskTodoSync._save() clobbered orphan bucket — "
+            "use read-modify-write."
+        )
+
+
+class TestSectionSyncIntegration:
+    """SectionSync doesn't probe Jira directly — it consults the
+    existing tombstone (written earlier in the same cycle by
+    SubtaskTodoSync or ConfluenceSync) and skips destructive
+    Notion↔Confluence reconciliation on orphan pairs."""
+
+    def _make_sync(self, tmp_path):
+        from taskautomation import sync as sync_module
+        from taskautomation.sync import SectionSync
+        from taskautomation.orphan_keys import OrphanResolver
+        sf = make_state_file(tmp_path)
+        original = sync_module.STATE_FILE
+        sync_module.STATE_FILE = sf
+        try:
+            s = SectionSync.__new__(SectionSync)
+            s.jira = MagicMock()
+            s.notion = MagicMock()
+            s.confluence = MagicMock()
+            s.dry_run = False
+            s.stats = {
+                "checked": 0, "notion_to_conf": 0, "conf_to_notion": 0,
+                "conflicts": 0, "skipped": 0, "skipped_orphan": 0, "errors": 0,
+            }
+            s._state = {}
+            s._section_state = {}
+            s._orphans = OrphanResolver(sf)
+        finally:
+            sync_module.STATE_FILE = original
+        return s, sf
+
+    def test_pre_marked_orphan_is_skipped_without_jira_call(self, tmp_path):
+        from taskautomation.orphan_keys import OrphanResolver
+        s, sf = self._make_sync(tmp_path)
+        # Pre-existing tombstone (e.g. ConfluenceSync wrote it earlier
+        # this cycle).
+        OrphanResolver(sf).mark_orphaned("VC-114", source="jira_404")
+        s._orphans = OrphanResolver(sf)
+
+        s.notion.query_all_pages_with_jira_key.return_value = [
+            _notion_page("VC-114"),
+        ]
+        # Stub _sync_task — must NOT be invoked
+        s._sync_task = MagicMock()
+
+        import taskautomation.sync as sync_module
+        sync_module.time.sleep = lambda *a, **kw: None
+
+        s.run()
+
+        s._sync_task.assert_not_called()
+        # SectionSync must NOT make its own Jira probe (read-only consult).
+        s.jira.issue_exists.assert_not_called()
+        assert s.stats["skipped_orphan"] == 1
+        assert s.stats["errors"] == 0
+
+    def test_no_tombstone_lets_sync_proceed(self, tmp_path):
+        s, sf = self._make_sync(tmp_path)
+        s.notion.query_all_pages_with_jira_key.return_value = [
+            _notion_page("VC-200"),
+        ]
+        s._sync_task = MagicMock()
+
+        import taskautomation.sync as sync_module
+        sync_module.time.sleep = lambda *a, **kw: None
+
+        s.run()
+
+        s._sync_task.assert_called_once()
+        assert s.stats["skipped_orphan"] == 0
+
+
+class TestNotionToJiraDeletePath:
+    """When a Notion page disappears, NotionToJiraSync._handle_deleted_pages
+    waits 2 cycles, then archives the Jira issue. If the Jira issue
+    is already orphaned, it must NOT call jira.delete_issue (which
+    would 404), and it must clean local bookkeeping silently."""
+
+    def _make_sync(self, tmp_path):
+        from taskautomation import sync as sync_module
+        from taskautomation.sync import NotionToJiraSync
+        from taskautomation.orphan_keys import OrphanResolver
+        sf = make_state_file(tmp_path)
+        original = sync_module.STATE_FILE
+        sync_module.STATE_FILE = sf
+        try:
+            s = NotionToJiraSync.__new__(NotionToJiraSync)
+            s.jira = MagicMock()
+            s.notion = MagicMock()
+            s.dry_run = False
+            s.stats = {
+                "checked": 0, "updated": 0, "skipped": 0,
+                "skipped_orphan": 0, "errors": 0,
+            }
+            # Pretend VC-114 has been known for a while and is now
+            # missing from current Notion query for 2nd consecutive
+            # cycle.
+            s._state = {"missing_keys": {"VC-114": 1}}
+            s._known = {"VC-114": {"notion": "Done", "jira": "Done"}}
+            s._orphans = OrphanResolver(sf)
+        finally:
+            sync_module.STATE_FILE = original
+        return s, sf
+
+    def test_orphan_skips_jira_delete_when_pre_marked(self, tmp_path):
+        """Pre-existing tombstone means we already know Jira lost the
+        issue — don't call delete_issue."""
+        from taskautomation.orphan_keys import OrphanResolver
+        s, sf = self._make_sync(tmp_path)
+        OrphanResolver(sf).mark_orphaned("VC-114", source="jira_404")
+        s._orphans = OrphanResolver(sf)
+
+        s._handle_deleted_pages(current_keys=set())  # VC-114 missing
+
+        s.jira.delete_issue.assert_not_called()
+        s.jira.issue_exists.assert_not_called()
+        assert s.stats["skipped_orphan"] == 1
+        assert s.stats["errors"] == 0
+        # Local bookkeeping cleaned
+        assert "VC-114" not in s._known
+        assert "VC-114" not in s._state["missing_keys"]
+
+    def test_jira_404_via_probe_marks_orphan_no_delete_call(self, tmp_path):
+        """No prior tombstone, but live probe shows Jira is 404 →
+        mark orphan, don't call delete_issue, clean local state."""
+        s, sf = self._make_sync(tmp_path)
+        s.jira.issue_exists.return_value = False
+
+        s._handle_deleted_pages(current_keys=set())
+
+        s.jira.issue_exists.assert_called_once_with("VC-114")
+        s.jira.delete_issue.assert_not_called()
+        assert s.stats["skipped_orphan"] == 1
+        assert s.stats["errors"] == 0
+        on_disk = json.loads(sf.read_text())
+        assert "VC-114" in on_disk.get("orphaned_jira_keys", {})
+        assert "VC-114" not in s._known
+
+    def test_transient_probe_failure_does_not_delete_or_mark(self, tmp_path):
+        """issue_exists returning None → skip this cycle, retry later.
+        No delete, no tombstone, no errors."""
+        s, sf = self._make_sync(tmp_path)
+        s.jira.issue_exists.return_value = None
+
+        s._handle_deleted_pages(current_keys=set())
+
+        s.jira.delete_issue.assert_not_called()
+        on_disk = json.loads(sf.read_text())
+        assert "VC-114" not in on_disk.get("orphaned_jira_keys", {})
+        # Local state preserved for next cycle's retry
+        assert "VC-114" in s._known
+
+    def test_jira_200_lets_delete_proceed(self, tmp_path):
+        """Live issue → normal delete path. Tombstone must NOT be set."""
+        s, sf = self._make_sync(tmp_path)
+        s.jira.issue_exists.return_value = True
+        s.jira.delete_issue.return_value = True
+
+        s._handle_deleted_pages(current_keys=set())
+
+        s.jira.issue_exists.assert_called_once_with("VC-114")
+        s.jira.delete_issue.assert_called_once_with("VC-114")
+        assert s.stats["updated"] == 1
+        assert s.stats["skipped_orphan"] == 0
+        on_disk = json.loads(sf.read_text())
+        assert "VC-114" not in on_disk.get("orphaned_jira_keys", {})
