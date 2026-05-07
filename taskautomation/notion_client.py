@@ -31,24 +31,57 @@ class NotionClient:
             "Content-Type": "application/json",
         }
 
-    # ---- HTTP helper with rate-limit retry ----
+    # ---- HTTP helper with retry + backoff ----
+
+    _RETRYABLE_STATUS = {429, 502, 503, 504}
+    _MAX_RETRIES = 4
 
     def _request(self, method: str, url: str, **kwargs) -> requests.Response:
-        """HTTP request with retry on 429 (Notion rate limit)."""
+        """HTTP request with retry on transient errors.
+
+        Retries on: 429 (rate limit), 502/503/504 (server errors),
+        Timeout, ConnectionError. Uses exponential backoff with jitter.
+        Respects Retry-After header.
+        """
+        import random
         kwargs.setdefault("timeout", 30)
-        for attempt in range(3):
-            resp = getattr(requests, method)(
-                url, headers=self.headers, **kwargs
-            )
-            if resp.status_code == 429:
-                retry_after = int(resp.headers.get("Retry-After", 1))
-                log.warning(
-                    "Rate limited, retry in %ds (attempt %d/3)",
-                    retry_after, attempt + 1,
+        last_exc = None
+
+        for attempt in range(self._MAX_RETRIES):
+            try:
+                resp = getattr(requests, method)(
+                    url, headers=self.headers, **kwargs
                 )
-                time.sleep(retry_after)
+            except (requests.exceptions.Timeout,
+                    requests.exceptions.ConnectionError) as e:
+                last_exc = e
+                delay = min(2 ** attempt + random.uniform(0, 1), 30)
+                log.warning(
+                    "Request %s %s failed (%s), retry %d/%d in %.1fs",
+                    method.upper(), url.split("?")[0].split("/")[-1],
+                    type(e).__name__, attempt + 1, self._MAX_RETRIES, delay,
+                )
+                time.sleep(delay)
                 continue
-            return resp
+
+            if resp.status_code not in self._RETRYABLE_STATUS:
+                return resp
+
+            # Retryable HTTP status
+            if resp.status_code == 429:
+                delay = float(resp.headers.get("Retry-After", 2 ** attempt))
+            else:
+                delay = min(2 ** attempt + random.uniform(0, 1), 30)
+            log.warning(
+                "Request %s %s returned %d, retry %d/%d in %.1fs",
+                method.upper(), url.split("?")[0].split("/")[-1],
+                resp.status_code, attempt + 1, self._MAX_RETRIES, delay,
+            )
+            time.sleep(delay)
+
+        # Exhausted retries — return last response or raise last exception
+        if last_exc is not None:
+            raise last_exc
         return resp
 
     # ---- Page Queries ----
@@ -64,7 +97,7 @@ class NotionClient:
             "page_size": 1,
         }
 
-        resp = requests.post(url, headers=self.headers, json=payload, timeout=30)
+        resp = self._request("post", url, json=payload)
         resp.raise_for_status()
         results = resp.json().get("results", [])
         return results[0] if results else None
@@ -87,9 +120,7 @@ class NotionClient:
             if start_cursor:
                 payload["start_cursor"] = start_cursor
 
-            resp = requests.post(
-                url, headers=self.headers, json=payload, timeout=30
-            )
+            resp = self._request("post", url, json=payload)
             resp.raise_for_status()
             data = resp.json()
             all_pages.extend(data.get("results", []))
@@ -184,9 +215,7 @@ class NotionClient:
         url = f"{self.API_URL}/pages/{page_id}"
         payload = {"properties": properties}
 
-        resp = requests.patch(
-            url, headers=self.headers, json=payload, timeout=30
-        )
+        resp = self._request("patch", url, json=payload)
         if resp.status_code == 200:
             return True
         log.error(
@@ -281,9 +310,7 @@ class NotionClient:
             if start_cursor:
                 params["start_cursor"] = start_cursor
 
-            resp = requests.get(
-                url, headers=self.headers, params=params, timeout=30
-            )
+            resp = self._request("get", url, params=params)
             resp.raise_for_status()
             data = resp.json()
             all_blocks.extend(data.get("results", []))
@@ -364,9 +391,7 @@ class NotionClient:
         url = f"{self.API_URL}/blocks/{block_id}"
         payload = {block_type: {"rich_text": rich_text}}
 
-        resp = requests.patch(
-            url, headers=self.headers, json=payload, timeout=30
-        )
+        resp = self._request("patch", url, json=payload)
         if resp.status_code == 200:
             return True
         log.error(
@@ -402,9 +427,7 @@ class NotionClient:
         url = f"{self.API_URL}/blocks/{block_id}/children"
         payload = {"children": children}
 
-        resp = requests.patch(
-            url, headers=self.headers, json=payload, timeout=30
-        )
+        resp = self._request("patch", url, json=payload)
         if resp.status_code == 200:
             return True
         log.error(
@@ -418,7 +441,7 @@ class NotionClient:
     def delete_block(self, block_id: str) -> bool:
         """Delete a block."""
         url = f"{self.API_URL}/blocks/{block_id}"
-        resp = requests.delete(url, headers=self.headers, timeout=30)
+        resp = self._request("delete", url)
         return resp.status_code == 200
 
     # ---- Section content API ----

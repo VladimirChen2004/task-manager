@@ -33,12 +33,55 @@ class ConfluenceClient:
         if not all([self.email, self.api_token]):
             raise ValueError("Confluence credentials required (JIRA_EMAIL + JIRA_API_TOKEN)")
 
-    # ---- HTTP helper ----
+    # ---- HTTP helper with retry + backoff ----
+
+    _RETRYABLE_STATUS = {429, 502, 503, 504}
+    _MAX_RETRIES = 4
 
     def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+        """HTTP request with retry on transient errors.
+
+        Retries on: 429 (rate limit), 502/503/504 (server errors),
+        Timeout, ConnectionError. Uses exponential backoff with jitter.
+        """
+        import random
+        import time as _time
         kwargs.setdefault("timeout", 30)
         kwargs.setdefault("headers", {"Content-Type": "application/json"})
-        return getattr(requests, method)(url, auth=self._auth, **kwargs)
+        last_exc = None
+
+        for attempt in range(self._MAX_RETRIES):
+            try:
+                resp = getattr(requests, method)(url, auth=self._auth, **kwargs)
+            except (requests.exceptions.Timeout,
+                    requests.exceptions.ConnectionError) as e:
+                last_exc = e
+                delay = min(2 ** attempt + random.uniform(0, 1), 30)
+                log.warning(
+                    "Confluence %s %s failed (%s), retry %d/%d in %.1fs",
+                    method.upper(), url.split("?")[0].split("/")[-1],
+                    type(e).__name__, attempt + 1, self._MAX_RETRIES, delay,
+                )
+                _time.sleep(delay)
+                continue
+
+            if resp.status_code not in self._RETRYABLE_STATUS:
+                return resp
+
+            if resp.status_code == 429:
+                delay = float(resp.headers.get("Retry-After", 2 ** attempt))
+            else:
+                delay = min(2 ** attempt + random.uniform(0, 1), 30)
+            log.warning(
+                "Confluence %s %s returned %d, retry %d/%d in %.1fs",
+                method.upper(), url.split("?")[0].split("/")[-1],
+                resp.status_code, attempt + 1, self._MAX_RETRIES, delay,
+            )
+            _time.sleep(delay)
+
+        if last_exc is not None:
+            raise last_exc
+        return resp
 
     # ---- Page CRUD ----
 

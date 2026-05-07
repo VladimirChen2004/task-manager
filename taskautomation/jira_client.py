@@ -45,6 +45,55 @@ class JiraVCHEN:
         )
         self._auth = (self.email, self.api_token)
 
+    # ---- HTTP helper with retry + backoff ----
+
+    _RETRYABLE_STATUS = {429, 502, 503, 504}
+    _MAX_RETRIES = 4
+
+    def _request(self, method: str, url: str, **kwargs) -> http_requests.Response:
+        """HTTP request with retry on transient errors."""
+        import random
+        import time as _time
+        kwargs.setdefault("timeout", 30)
+        last_exc = None
+
+        for attempt in range(self._MAX_RETRIES):
+            try:
+                resp = getattr(http_requests, method)(
+                    url, auth=self._auth, **kwargs
+                )
+            except (http_requests.exceptions.Timeout,
+                    http_requests.exceptions.ConnectionError) as e:
+                last_exc = e
+                delay = min(2 ** attempt + random.uniform(0, 1), 30)
+                import logging
+                logging.getLogger("taskautomation.jira").warning(
+                    "Jira %s %s failed (%s), retry %d/%d in %.1fs",
+                    method.upper(), url.split("?")[0].split("/")[-1],
+                    type(e).__name__, attempt + 1, self._MAX_RETRIES, delay,
+                )
+                _time.sleep(delay)
+                continue
+
+            if resp.status_code not in self._RETRYABLE_STATUS:
+                return resp
+
+            if resp.status_code == 429:
+                delay = float(resp.headers.get("Retry-After", 2 ** attempt))
+            else:
+                delay = min(2 ** attempt + random.uniform(0, 1), 30)
+            import logging
+            logging.getLogger("taskautomation.jira").warning(
+                "Jira %s %s returned %d, retry %d/%d in %.1fs",
+                method.upper(), url.split("?")[0].split("/")[-1],
+                resp.status_code, attempt + 1, self._MAX_RETRIES, delay,
+            )
+            _time.sleep(delay)
+
+        if last_exc is not None:
+            raise last_exc
+        return resp
+
     # ---- JQL Search (v3 /search/jql endpoint) ----
 
     SEARCH_FIELDS = "summary,status,priority,labels,created,updated,duedate,description,subtasks,issuetype,parent"
@@ -62,7 +111,7 @@ class JiraVCHEN:
                 "startAt": start_at,
                 "fields": self.SEARCH_FIELDS,
             }
-            resp = http_requests.get(url, auth=self._auth, params=params, timeout=30)
+            resp = self._request("get", url, params=params)
             resp.raise_for_status()
             data = resp.json()
 
@@ -213,10 +262,8 @@ class JiraVCHEN:
             payload["fields"]["duedate"] = due_date
 
         url = f"{self.server}/rest/api/3/issue"
-        resp = http_requests.post(
-            url, auth=self._auth, json=payload,
-            headers={"Content-Type": "application/json"}, timeout=30
-        )
+        resp = self._request("post", url, json=payload,
+                             headers={"Content-Type": "application/json"})
         resp.raise_for_status()
         data = resp.json()
         return {
@@ -275,10 +322,8 @@ class JiraVCHEN:
                 }
 
             url = f"{self.server}/rest/api/3/issue"
-            resp = http_requests.post(
-                url, auth=self._auth, json=payload,
-                headers={"Content-Type": "application/json"}, timeout=30
-            )
+            resp = self._request("post", url, json=payload,
+                                 headers={"Content-Type": "application/json"})
             resp.raise_for_status()
             data = resp.json()
             sub_key = data["key"]
@@ -297,11 +342,9 @@ class JiraVCHEN:
             "inwardIssue": {"key": parent_key},
             "outwardIssue": {"key": child_key},
         }
-        resp = http_requests.post(
-            f"{self.server}/rest/api/3/issueLink",
-            auth=self._auth, json=payload,
-            headers={"Content-Type": "application/json"}, timeout=30,
-        )
+        resp = self._request("post", f"{self.server}/rest/api/3/issueLink",
+                             json=payload,
+                             headers={"Content-Type": "application/json"})
         return resp.status_code in (200, 201)
 
     def update_description(
@@ -315,10 +358,8 @@ class JiraVCHEN:
         adf = self._build_adf_description(description, notion_url, confluence_url)
         url = f"{self.server}/rest/api/3/issue/{issue_key}"
         payload = {"fields": {"description": adf}}
-        resp = http_requests.put(
-            url, auth=self._auth, json=payload,
-            headers={"Content-Type": "application/json"}, timeout=30,
-        )
+        resp = self._request("put", url, json=payload,
+                             headers={"Content-Type": "application/json"})
         return resp.status_code in (200, 204)
 
     # ---- Issue Queries ----
@@ -326,7 +367,7 @@ class JiraVCHEN:
     def get_issue(self, issue_key: str) -> Dict[str, Any]:
         """Get issue details with subtask progress."""
         url = f"{self.server}/rest/api/3/issue/{issue_key}"
-        resp = http_requests.get(url, auth=self._auth, timeout=30)
+        resp = self._request("get", url)
         resp.raise_for_status()
         raw = resp.json()
         result = self._raw_issue_to_dict(raw, self.server)
@@ -384,7 +425,7 @@ class JiraVCHEN:
             return {"done": done, "total": total, "percentage": pct}
 
         url = f"{self.server}/rest/api/3/issue/{issue_key}"
-        resp = http_requests.get(url, auth=self._auth, timeout=30)
+        resp = self._request("get", url)
         resp.raise_for_status()
         return self._raw_subtask_progress(resp.json())
 
@@ -460,16 +501,14 @@ class JiraVCHEN:
         """Rename a Jira issue (update summary)."""
         url = f"{self.server}/rest/api/3/issue/{issue_key}"
         payload = {"fields": {"summary": new_summary}}
-        resp = http_requests.put(
-            url, auth=self._auth, json=payload,
-            headers={"Content-Type": "application/json"}, timeout=30,
-        )
+        resp = self._request("put", url, json=payload,
+                             headers={"Content-Type": "application/json"})
         return resp.status_code in (200, 204)
 
     def delete_issue(self, issue_key: str) -> bool:
         """Delete a Jira issue (subtask or linked task)."""
         url = f"{self.server}/rest/api/3/issue/{issue_key}"
-        resp = http_requests.delete(url, auth=self._auth, timeout=30)
+        resp = self._request("delete", url)
         return resp.status_code in (200, 204)
 
     # ---- Custom Fields ----
@@ -504,20 +543,16 @@ class JiraVCHEN:
         )
         url = f"{self.server}/rest/api/3/issue/{issue_key}"
         payload = {"fields": {self.PROGRESS_FIELD: bar}}
-        resp = http_requests.put(
-            url, auth=self._auth, json=payload,
-            headers={"Content-Type": "application/json"}, timeout=30,
-        )
+        resp = self._request("put", url, json=payload,
+                             headers={"Content-Type": "application/json"})
         return resp.status_code in (200, 204)
 
     def update_confluence_url(self, issue_key: str, confluence_url: str) -> bool:
         """Update 'Confluence URL' field."""
         url = f"{self.server}/rest/api/3/issue/{issue_key}"
         payload = {"fields": {self.CONFLUENCE_URL_FIELD: confluence_url}}
-        resp = http_requests.put(
-            url, auth=self._auth, json=payload,
-            headers={"Content-Type": "application/json"}, timeout=30,
-        )
+        resp = self._request("put", url, json=payload,
+                             headers={"Content-Type": "application/json"})
         return resp.status_code in (200, 204)
 
     # ---- Field Updates ----
@@ -525,12 +560,8 @@ class JiraVCHEN:
     def update_priority(self, issue_key: str, priority_name: str) -> bool:
         """Update the priority of a Jira issue."""
         url = f"{self.server}/rest/api/3/issue/{issue_key}"
-        resp = http_requests.put(
-            url,
-            json={"fields": {"priority": {"name": priority_name}}},
-            auth=self._auth,
-            timeout=30,
-        )
+        resp = self._request("put", url,
+                             json={"fields": {"priority": {"name": priority_name}}})
         if resp.status_code == 204:
             return True
         log.error("Failed to update priority %s: %s %s", issue_key, resp.status_code, resp.text[:200])
