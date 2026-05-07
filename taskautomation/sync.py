@@ -1377,6 +1377,15 @@ class SubtaskTodoSync:
                     if plan_html:
                         conf_tasks = ConfluenceClient.parse_task_list(plan_html)
 
+            # Refresh Notion baseline only when this item actually had
+            # Notion-mutating actions. Otherwise the page wasn't touched
+            # and the prior last_edited is already correct — no need to
+            # spend an extra GET /pages/{id}.
+            if self._actions_mutate_notion(actions):
+                last_edited = self._refresh_notion_last_edited(
+                    page_id, last_edited,
+                )
+
         self._save_known_state(
             jira_key, last_edited, conf_when, subtasks, todos, conf_tasks,
         )
@@ -1815,6 +1824,63 @@ class SubtaskTodoSync:
         return False
 
     # ---- Known state persistence ----
+
+    # Action ops that mutate Notion (and bump page.last_edited_time
+    # on the server). After any of these, the saved baseline must be
+    # refreshed via _refresh_notion_last_edited so the next cycle
+    # doesn't see a false notion_changed delta.
+    _NOTION_MUTATING_OPS = {"create_todo", "check_todo", "uncheck_todo"}
+
+    @classmethod
+    def _actions_mutate_notion(cls, actions: List[tuple]) -> bool:
+        """Return True if any action in the list mutates Notion."""
+        return any(
+            (a and a[0] in cls._NOTION_MUTATING_OPS) for a in actions
+        )
+
+    def _refresh_notion_last_edited(
+        self, page_id: str, previous_last_edited: str,
+    ) -> str:
+        """Refetch page metadata to get the server-side last_edited_time.
+
+        Called after own writes to Notion so the saved baseline
+        reflects the timestamp the server recorded for our PATCH.
+        Without this, next cycle reads page.last_edited_time
+        (already advanced by us), compares to a stale baseline, and
+        falsely concludes "Notion changed".
+
+        On any failure (network error, 404, missing field) returns the
+        previous timestamp and logs a warning — at most one noisy
+        delta on the next cycle, never a sync crash.
+        """
+        try:
+            page = self.notion.get_page(page_id)
+        except Exception as e:
+            log.warning(
+                "Failed to refresh Notion baseline for %s: %s — "
+                "keeping old timestamp",
+                page_id, e,
+            )
+            return previous_last_edited
+
+        if not page:
+            log.warning(
+                "Notion get_page returned no page for %s — "
+                "keeping old timestamp",
+                page_id,
+            )
+            return previous_last_edited
+
+        fresh = page.get("last_edited_time")
+        if not fresh:
+            log.warning(
+                "Notion page %s has no last_edited_time — "
+                "keeping old timestamp",
+                page_id,
+            )
+            return previous_last_edited
+
+        return fresh
 
     def _save_known_state(
         self,

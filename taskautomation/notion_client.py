@@ -157,6 +157,26 @@ class NotionClient:
 
         return all_pages
 
+    def get_page(self, page_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch a single page (metadata + properties).
+
+        GET — idempotent and retried automatically by ``_request``.
+        Returns the raw Notion page dict, or ``None`` on hard failure
+        (404, auth lost). Caller is expected to be tolerant of None.
+        """
+        url = f"{self.API_URL}/pages/{page_id}"
+        try:
+            resp = self._request("get", url)
+        except Exception as e:
+            log.warning("get_page %s failed: %s", page_id, e)
+            return None
+        if resp.status_code == 200:
+            return resp.json()
+        log.warning(
+            "get_page %s returned %d", page_id, resp.status_code,
+        )
+        return None
+
     def get_page_status(self, page: Dict[str, Any]) -> Optional[str]:
         """Extract current Status from a Notion page dict."""
         status_prop = page.get("properties", {}).get("Status", {})
