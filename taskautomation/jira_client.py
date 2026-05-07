@@ -389,28 +389,44 @@ class JiraVCHEN:
         return self._raw_subtask_progress(resp.json())
 
     def get_subtask_details(self, parent_key: str) -> List[Dict[str, Any]]:
-        """Get subtask details for an issue with is_done flag.
+        """Get subtask details for an issue with is_done flag and updated timestamp.
 
-        Returns: [{"key": "VC-14", "summary": "...", "status": "...", "is_done": bool}]
+        Returns: [{"key": "VC-14", "summary": "...", "status": "...",
+                   "is_done": bool, "updated": "ISO-timestamp"}]
         Supports both native subtasks and VCSUB-linked tasks.
         """
         if SUBTASK_PROJECT:
             return self._get_linked_subtask_details(parent_key)
 
-        issue = self.get_issue(parent_key)
+        # Native subtasks: JQL search to get per-subtask `updated` field
+        # (embedded subtasks array on parent doesn't include timestamps)
+        jql = f'parent = "{parent_key}" ORDER BY created ASC'
+        saved = self.SEARCH_FIELDS
+        self.SEARCH_FIELDS = "summary,status,updated"
+        raw_issues = self._search_jql(jql, max_results=50)
+        self.SEARCH_FIELDS = saved
+
         result = []
-        for st in issue.get("subtasks", []):
-            status = st.get("status", "")
-            is_done = status.lower() in ("done", "готово", "closed", "resolved")
+        for raw in raw_issues:
+            fields = raw.get("fields", {})
+            status_name = fields.get("status", {}).get("name", "")
+            cat_key = (
+                fields.get("status", {}).get("statusCategory", {}).get("key", "")
+            )
+            is_done = (
+                cat_key == "done"
+                or status_name.lower() in ("done", "готово", "closed", "resolved")
+            )
             result.append({
-                "key": st["key"],
-                "summary": st.get("summary", ""),
-                "status": status,
+                "key": raw["key"],
+                "summary": fields.get("summary", ""),
+                "status": status_name,
                 "is_done": is_done,
+                "updated": fields.get("updated", ""),
             })
         return result
 
-    _LINKED_SEARCH_FIELDS = "summary,status,labels"
+    _LINKED_SEARCH_FIELDS = "summary,status,labels,updated"
 
     def _get_linked_subtask_details(
         self, parent_key: str
@@ -436,6 +452,7 @@ class JiraVCHEN:
                 "summary": fields.get("summary", ""),
                 "status": status_name,
                 "is_done": is_done,
+                "updated": fields.get("updated", ""),
             })
         return result
 

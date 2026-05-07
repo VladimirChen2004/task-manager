@@ -461,16 +461,36 @@ class NotionClient:
         """Replace all children of a toggle heading with new blocks.
 
         1. Finds toggle by heading_text
-        2. Deletes all existing children
-        3. Appends new_children
+        2. Converts both existing and new blocks to XHTML and compares
+           hashes — skips if unchanged (idempotency guard)
+        3. Deletes all existing children
+        4. Appends new_children
         """
         toggle_id = self.find_toggle_by_text(page_id, heading_text)
         if not toggle_id:
             log.warning("Toggle '%s' not found on page %s", heading_text, page_id)
             return False
 
-        # Delete existing children
+        # Read existing children
         existing = self.get_block_children(toggle_id)
+
+        # Idempotency guard: convert both to XHTML and compare hashes.
+        # This uses the same converter as SectionSync, catching all
+        # content types (links, annotations, code, tables, etc.)
+        try:
+            from .content_converter import compute_content_hash, notion_blocks_to_xhtml
+            existing_hash = compute_content_hash(notion_blocks_to_xhtml(existing))
+            new_hash = compute_content_hash(notion_blocks_to_xhtml(new_children))
+            if existing_hash == new_hash:
+                log.debug(
+                    "Toggle '%s' content unchanged (hash=%s), skipping write",
+                    heading_text, existing_hash,
+                )
+                return True
+        except Exception as e:
+            log.debug("Fingerprint comparison failed, proceeding with write: %s", e)
+
+        # Delete existing children
         for child in existing:
             self.delete_block(child["id"])
 

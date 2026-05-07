@@ -756,17 +756,12 @@ def _add_template_sections(
     Checks for MVP, Результат, Заметки/Лог, Описание, and 🤖 callout.
     Only adds sections that don't already exist.
     """
+    # Order: Описание задачи → MVP → Заметки / Лог → Результат (снизу)
     template_toggles = [
         ("Минимальный функционал (MVP)", {
             "object": "block", "type": "bulleted_list_item",
             "bulleted_list_item": {"rich_text": [{"type": "text",
                 "text": {"content": "Описать минимально необходимый результат"},
-                "annotations": {"italic": True}}]},
-        }),
-        ("Результат", {
-            "object": "block", "type": "paragraph",
-            "paragraph": {"rich_text": [{"type": "text",
-                "text": {"content": "Описание выполненной работы (заполняется по итогу)."},
                 "annotations": {"italic": True}}]},
         }),
         ("Заметки / Лог", {
@@ -775,22 +770,17 @@ def _add_template_sections(
                 "text": {"content": "Заметки по ходу работы над задачей."},
                 "annotations": {"italic": True}}]},
         }),
+        ("Результат", {
+            "object": "block", "type": "paragraph",
+            "paragraph": {"rich_text": [{"type": "text",
+                "text": {"content": "Описание выполненной работы (заполняется по итогу)."},
+                "annotations": {"italic": True}}]},
+        }),
     ]
 
     blocks_to_add: List[Dict[str, Any]] = []
 
-    for heading_text, placeholder_child in template_toggles:
-        if notion.find_toggle_by_text(page_id, heading_text):
-            continue
-        blocks_to_add.append({
-            "object": "block", "type": "heading_2",
-            "heading_2": {
-                "rich_text": [{"type": "text", "text": {"content": heading_text}}],
-                "is_toggleable": True,
-                "children": [placeholder_child],
-            },
-        })
-
+    # Описание задачи — всегда первым
     if description:
         if not notion.find_toggle_by_text(page_id, "Описание задачи"):
             blocks_to_add.append({
@@ -804,6 +794,18 @@ def _add_template_sections(
                         ]}}],
                 },
             })
+
+    for heading_text, placeholder_child in template_toggles:
+        if notion.find_toggle_by_text(page_id, heading_text):
+            continue
+        blocks_to_add.append({
+            "object": "block", "type": "heading_2",
+            "heading_2": {
+                "rich_text": [{"type": "text", "text": {"content": heading_text}}],
+                "is_toggleable": True,
+                "children": [placeholder_child],
+            },
+        })
 
     page_blocks = notion.get_block_children(page_id)
     has_robot = any(
@@ -1204,9 +1206,14 @@ class JiraToNotionCreator:
 
 
 class SubtaskTodoSync:
-    """Syncs Notion to-do checkboxes with Jira subtask statuses.
+    """True three-way sync: Notion to-dos ↔ Jira subtasks ↔ Confluence tasks.
 
-    Only syncs to-do blocks under a 'План выполнения' toggle heading.
+    All three sources are equal peers. On each cycle:
+    1. Read current state from all three
+    2. Build unified item list (matched by title)
+    3. For each item: detect who changed (delta vs known state),
+       resolve conflicts by last-edit timestamp, propagate to others
+    4. All creates + updates happen in a single cycle
     """
 
     PLAN_HEADING = "План выполнения"
@@ -1216,10 +1223,12 @@ class SubtaskTodoSync:
         self,
         jira: JiraVCHEN,
         notion: NotionClient,
+        confluence: Optional["ConfluenceClient"] = None,
         dry_run: bool = False,
     ):
         self.jira = jira
         self.notion = notion
+        self.confluence = confluence
         self.dry_run = dry_run
         self.stats = {
             "pages_checked": 0, "todos_synced": 0,
@@ -1231,7 +1240,7 @@ class SubtaskTodoSync:
         self._known = self._state.get("subtask_todos", {})
 
     def run(self):
-        log.info("Subtask↔Todo sync: starting")
+        log.info("Subtask↔Todo sync: starting (three-way)")
         pages = self.notion.query_all_pages_with_jira_key()
         log.info("Found %d pages with Jira Key", len(pages))
 
@@ -1245,82 +1254,615 @@ class SubtaskTodoSync:
                 self._sync_page(page, jira_key)
             except Exception as e:
                 self.stats["errors"] += 1
-                log.error("Subtask sync error for %s: %s", jira_key, e)
+                log.error("Subtask sync error for %s: %s", jira_key, e, exc_info=True)
             time.sleep(0.4)
 
         self._save()
         self._log_stats()
 
+    # ---- Main sync logic (per page) ----
+
     def _sync_page(self, page: Dict[str, Any], jira_key: str):
         page_id = page["id"]
-
-        # Check if page was recently modified (optimization)
         last_edited = page.get("last_edited_time", "")
         known_page = self._known.get(jira_key, {})
-        known_last_edited = known_page.get("page_last_edited", "")
 
-        # Get subtasks from Jira (cheap — single API call)
+        # Migrate old known state format → treat as empty
+        if "todos" in known_page and "items" not in known_page:
+            known_page = {}
+
+        # ── Step 1: Read all 3 sources ──────────────────────────
+
         subtasks = self.jira.get_subtask_details(jira_key)
-        if not subtasks:
-            return  # No subtasks, nothing to sync
 
-        # Always update progress bar (cheap PUT, keeps bar in sync)
-        if not self.dry_run:
-            self.jira.update_delivery_progress_field(jira_key)
+        conf_tasks: List[Dict] = []
+        conf_page: Optional[Dict] = None
+        conf_body: Optional[str] = None
+        conf_version: Optional[int] = None
+        conf_when: str = ""
+        if self.confluence:
+            conf_page = self.confluence.find_page_by_jira_key(jira_key)
+            if conf_page:
+                full = self.confluence.get_page_with_version(conf_page["id"])
+                if full:
+                    conf_body = full["body"]["storage"]["value"]
+                    conf_version = full["version"]["number"]
+                    conf_when = full["version"].get("when", "")
+                    plan_html = ConfluenceClient.extract_section(
+                        conf_body, self.PLAN_HEADING
+                    )
+                    if plan_html:
+                        conf_tasks = ConfluenceClient.parse_task_list(plan_html)
 
-        # Find plan heading
+        # Nothing anywhere → skip
+        if not subtasks and not conf_tasks:
+            return
+
+        # ── Step 1b: Early exit if nothing changed ──────────────
+
+        jira_changed = self._jira_subtasks_changed(jira_key, subtasks, known_page)
+        conf_changed = self._confluence_tasks_changed(jira_key, conf_tasks, known_page)
+        notion_changed = last_edited != known_page.get("page_last_edited", "")
+
+        if not jira_changed and not conf_changed and not notion_changed:
+            return
+
+        # ── Step 2: Ensure plan heading exists in Notion ────────
+
         heading_id = self.notion.find_toggle_by_text(page_id, self.PLAN_HEADING)
 
         if not heading_id:
-            # No plan section yet — create from Jira subtasks
-            self._add_plan_section(page_id, jira_key, subtasks)
+            # Bootstrap: create plan section from whatever exists
+            source_items = subtasks or [
+                {"summary": ct["text"], "is_done": ct["checked"]}
+                for ct in conf_tasks
+            ]
+            if source_items:
+                self._add_plan_section(page_id, jira_key, source_items)
+            # Record baseline state, sync on next cycle
+            self._save_known_state(
+                jira_key, last_edited, conf_when, subtasks, [], conf_tasks
+            )
             return
 
-        # Skip expensive block reads if nothing changed on either side
-        jira_changed = self._jira_subtasks_changed(jira_key, subtasks)
-        if last_edited == known_last_edited and not jira_changed:
-            return
-
-        # Read to-do blocks
+        # Read Notion to-dos
         todos = self.notion.get_todo_children(heading_id)
 
-        # Sync
-        self._sync_todos_with_subtasks(
-            jira_key, heading_id, todos, subtasks
-        )
+        # ── Step 3: Build unified items + resolve ───────────────
 
-        # Update known state
-        self._known[jira_key] = {
-            "page_last_edited": last_edited,
-            "todos": {
-                todo["text"]: todo["checked"] for todo in todos
-            },
-            "subtask_statuses": {
-                st["key"]: st["is_done"] for st in subtasks
-            },
+        unified = self._build_unified_items(todos, subtasks, conf_tasks)
+        known_items = known_page.get("items", {})
+        timestamps = {
+            "notion": last_edited,
+            "conf": conf_when,
         }
 
+        actions: List[tuple] = []
+        for item in unified:
+            item_actions = self._resolve_item(
+                jira_key, item, known_items, timestamps, heading_id,
+            )
+            actions.extend(item_actions)
+
+        # ── Step 4: Execute all actions ─────────────────────────
+
+        if actions:
+            self._execute_actions(
+                jira_key, actions, heading_id,
+                conf_page, conf_body, conf_version, unified,
+            )
+        # No elif: if no actions, don't touch Confluence — avoids
+        # unnecessary page versions and hidden Jira priority fallback.
+
+        # Update progress bar
+        if not self.dry_run:
+            self.jira.update_delivery_progress_field(jira_key)
+
+        # ── Step 5: Save known state ────────────────────────────
+
+        # Re-read all sources to get fresh state after actions.
+        # Without this, _save_known_state records stale pre-action data,
+        # causing false deltas on the next cycle.
+        if actions:
+            subtasks = self.jira.get_subtask_details(jira_key)
+            todos = self.notion.get_todo_children(heading_id)
+            if self.confluence and conf_page:
+                full = self.confluence.get_page_with_version(conf_page["id"])
+                if full:
+                    conf_body_fresh = full["body"]["storage"]["value"]
+                    conf_when = full["version"].get("when", "")
+                    plan_html = ConfluenceClient.extract_section(
+                        conf_body_fresh, self.PLAN_HEADING,
+                    )
+                    if plan_html:
+                        conf_tasks = ConfluenceClient.parse_task_list(plan_html)
+
+        self._save_known_state(
+            jira_key, last_edited, conf_when, subtasks, todos, conf_tasks,
+        )
+
+    # ---- Unified item builder ----
+
+    @staticmethod
+    def _build_unified_items(
+        todos: List[Dict],
+        subtasks: List[Dict],
+        conf_tasks: List[Dict],
+    ) -> List[Dict]:
+        """Match items across all 3 sources by title (case-insensitive).
+
+        Returns: [{"title", "match_key", "notion", "jira", "conf"}, ...]
+        """
+        from collections import OrderedDict
+        items: Dict[str, Dict] = OrderedDict()
+
+        # Jira subtasks first (most stable identifiers)
+        for st in subtasks:
+            mk = st["summary"].strip().lower()
+            items[mk] = {
+                "title": st["summary"].strip(),
+                "match_key": mk,
+                "notion": None,
+                "jira": st,
+                "conf": None,
+            }
+
+        # Notion to-dos
+        for todo in todos:
+            mk = todo["text"].strip().lower()
+            if mk in items:
+                items[mk]["notion"] = todo
+            else:
+                items[mk] = {
+                    "title": todo["text"].strip(),
+                    "match_key": mk,
+                    "notion": todo,
+                    "jira": None,
+                    "conf": None,
+                }
+
+        # Confluence tasks
+        for ct in conf_tasks:
+            mk = ct["text"].strip().lower()
+            if mk in items:
+                items[mk]["conf"] = ct
+            else:
+                items[mk] = {
+                    "title": ct["text"].strip(),
+                    "match_key": mk,
+                    "notion": None,
+                    "jira": None,
+                    "conf": ct,
+                }
+
+        return list(items.values())
+
+    # ---- Per-item three-way resolution ----
+
+    def _resolve_item(
+        self,
+        jira_key: str,
+        item: Dict,
+        known_items: Dict,
+        timestamps: Dict,
+        heading_id: str,
+    ) -> List[tuple]:
+        """Determine actions for a single unified item.
+
+        Returns list of action tuples to execute.
+        """
+        mk = item["match_key"]
+        known = known_items.get(mk)  # Previous cycle state, or None
+
+        notion = item["notion"]
+        jira = item["jira"]
+        conf = item["conf"]
+
+        actions: List[tuple] = []
+
+        # ── New item (no known state) ───────────────────────────
+        # First time seeing this item: ONLY create in missing sources.
+        # NEVER change existing checked states — we don't know who is
+        # "right" without a previous baseline to compare against.
+        # The current state becomes the baseline for next cycle.
+
+        if not known:
+            # Determine checked from whichever source(s) already exist
+            checked = self._pick_initial_checked(notion, jira, conf)
+
+            if not jira:
+                actions.append(("create_subtask", item["title"], checked))
+            if not notion:
+                actions.append(("create_todo", item["title"], checked, heading_id))
+            if not conf:
+                actions.append(("set_conf_item", item["title"], checked))
+
+            # DO NOT align existing sources — just record baseline
+            return actions
+
+        # ── Known item — check for missing sources ──────────────
+
+        # Item disappeared from Jira (deleted subtask) → don't recreate,
+        # just clean from known state
+        if not jira and known.get("jira_checked") is not None:
+            return [("remove_from_known", mk)]
+
+        # Create in missing sources
+        if not jira:
+            checked = self._current_checked(notion, conf)
+            actions.append(("create_subtask", item["title"], checked))
+        if not notion:
+            checked = self._current_checked(jira, conf)
+            actions.append(("create_todo", item["title"], checked, heading_id))
+        if not conf:
+            checked = self._current_checked(notion, jira)
+            actions.append(("set_conf_item", item["title"], checked))
+
+        # ── Checkbox state resolution ───────────────────────────
+
+        current = {}
+        if notion:
+            current["notion"] = notion["checked"]
+        if jira:
+            current["jira"] = jira["is_done"]
+        if conf:
+            current["conf"] = conf["checked"]
+
+        # All agree → in sync
+        values = set(current.values())
+        if len(values) <= 1:
+            self.stats["todos_synced"] += 1
+            return actions
+
+        # Build previous-cycle values
+        prev = {}
+        if known.get("notion_checked") is not None and notion:
+            prev["notion"] = known["notion_checked"]
+        if known.get("jira_checked") is not None and jira:
+            prev["jira"] = known["jira_checked"]
+        if known.get("conf_checked") is not None and conf:
+            prev["conf"] = known["conf_checked"]
+
+        # Which sources changed vs known?
+        changed = {
+            src for src in current
+            if src in prev and current[src] != prev[src]
+        }
+
+        # If no source shows a delta — don't touch anything.
+        # This happens when prev is incomplete (migration, new source added)
+        # or when values diverge but nothing changed vs last known.
+        # Safe default: record current state, resolve on next cycle.
+        if not changed:
+            return actions
+        else:
+            winner_value = self._resolve_conflict(
+                jira_key, item["title"], changed, current, timestamps,
+                jira_updated=jira.get("updated", "") if jira else "",
+            )
+
+        # Propagate winner to all sources that disagree
+        if notion and notion["checked"] != winner_value:
+            if winner_value:
+                actions.append(("check_todo", notion))
+            else:
+                actions.append(("uncheck_todo", notion))
+
+        if jira and jira["is_done"] != winner_value:
+            if winner_value:
+                actions.append(("close_subtask", jira))
+            else:
+                actions.append(("reopen_subtask", jira))
+
+        if conf and conf["checked"] != winner_value:
+            actions.append(("set_conf_item", item["title"], winner_value))
+
+        return actions
+
+    def _resolve_conflict(
+        self,
+        jira_key: str,
+        title: str,
+        changed: set,
+        current: Dict[str, bool],
+        timestamps: Dict,
+        jira_updated: str,
+    ) -> bool:
+        """Resolve which checked value wins.
+
+        Rules:
+        1. Single source changed → it wins
+        2. Multiple changed to same value → that value wins
+        3. Multiple changed to different values → latest timestamp wins
+        """
+        if len(changed) == 1:
+            src = next(iter(changed))
+            log.info("%s: '%s' — %s changed → propagating", jira_key, title, src)
+            return current[src]
+
+        changed_values = {current[src] for src in changed}
+        if len(changed_values) == 1:
+            val = changed_values.pop()
+            log.info(
+                "%s: '%s' — %s all changed to %s",
+                jira_key, title, "+".join(changed), val,
+            )
+            return val
+
+        # True conflict — timestamp wins
+        ts_map: Dict[str, Optional[datetime]] = {}
+        for src in changed:
+            if src == "jira" and jira_updated:
+                ts_map[src] = _parse_timestamp(jira_updated)
+            elif src == "notion" and timestamps.get("notion"):
+                ts_map[src] = _parse_timestamp(timestamps["notion"])
+            elif src == "conf" and timestamps.get("conf"):
+                ts_map[src] = _parse_timestamp(timestamps["conf"])
+
+        winner_src = None
+        winner_ts = None
+        for src, ts in ts_map.items():
+            if ts and (winner_ts is None or ts > winner_ts):
+                winner_ts = ts
+                winner_src = src
+
+        if winner_src:
+            log.info(
+                "%s: CONFLICT '%s' — %s wins (ts=%s)",
+                jira_key, title, winner_src,
+                winner_ts.isoformat() if winner_ts else "?",
+            )
+            return current[winner_src]
+
+        # Fallback: Jira wins (most reliable timestamps)
+        if "jira" in changed:
+            return current["jira"]
+        return current[next(iter(changed))]
+
+    @staticmethod
+    def _pick_initial_checked(
+        notion: Optional[Dict],
+        jira: Optional[Dict],
+        conf: Optional[Dict],
+    ) -> bool:
+        """Pick checked state for brand-new item from available sources."""
+        vals = []
+        if jira is not None:
+            vals.append(("jira", jira["is_done"]))
+        if notion is not None:
+            vals.append(("notion", notion["checked"]))
+        if conf is not None:
+            vals.append(("conf", conf["checked"]))
+
+        if not vals:
+            return False
+        if len(vals) == 1:
+            return vals[0][1]
+
+        checked_vals = {v[1] for v in vals}
+        if len(checked_vals) == 1:
+            return checked_vals.pop()
+
+        # Disagreement → Jira wins
+        for src, val in vals:
+            if src == "jira":
+                return val
+        return vals[0][1]
+
+    @staticmethod
+    def _current_checked(
+        *sources: Optional[Dict],
+    ) -> bool:
+        """Get checked state from the first available source."""
+        for s in sources:
+            if s is None:
+                continue
+            if "is_done" in s:
+                return s["is_done"]
+            if "checked" in s:
+                return s["checked"]
+        return False
+
+    # ---- Action execution ----
+
+    def _execute_actions(
+        self,
+        jira_key: str,
+        actions: List[tuple],
+        heading_id: str,
+        conf_page: Optional[Dict],
+        conf_body: Optional[str],
+        conf_version: Optional[int],
+        unified: List[Dict],
+    ):
+        """Execute collected actions. Confluence updates are batched."""
+        conf_overrides: Dict[str, bool] = {}  # title → checked
+
+        for action in actions:
+            op = action[0]
+
+            if op == "create_subtask":
+                _, title, checked = action
+                self._do_create_subtask(jira_key, title, checked)
+
+            elif op == "create_todo":
+                _, title, checked, parent_id = action
+                self._do_create_todo(parent_id, jira_key, title, checked)
+
+            elif op == "set_conf_item":
+                _, title, checked = action
+                conf_overrides[title] = checked
+
+            elif op == "check_todo":
+                _, todo = action
+                self._check_todo(todo, jira_key)
+
+            elif op == "uncheck_todo":
+                _, todo = action
+                self._uncheck_todo(todo, jira_key)
+
+            elif op == "close_subtask":
+                _, subtask = action
+                self._close_subtask(jira_key, subtask)
+
+            elif op == "reopen_subtask":
+                _, subtask = action
+                self._reopen_subtask(jira_key, subtask)
+
+            elif op == "remove_from_known":
+                pass  # Handled in _save_known_state
+
+        # Batch Confluence update — only if there are actual Confluence changes
+        if conf_overrides and self.confluence and conf_page and conf_body is not None:
+            self._update_confluence_from_unified(
+                jira_key, conf_page, conf_body, conf_version,
+                unified, conf_overrides,
+            )
+
+    # ---- Confluence batch update ----
+
+    def _update_confluence_from_unified(
+        self,
+        jira_key: str,
+        conf_page: Dict,
+        conf_body: str,
+        conf_version: int,
+        unified: List[Dict],
+        overrides: Dict[str, bool],
+    ):
+        """Rebuild Confluence task-list from unified state + overrides."""
+        if self.dry_run:
+            return
+
+        # Build items: prefer override (resolved action), then keep current
+        # Confluence state, then fall back to jira/notion for new items.
+        # Preserve existing UUIDs to avoid spurious page versions.
+        items = []
+        for u in unified:
+            title = u["title"]
+            if title in overrides:
+                checked = overrides[title]
+            elif u["conf"]:
+                checked = u["conf"]["checked"]
+            elif u["jira"]:
+                checked = u["jira"]["is_done"]
+            elif u["notion"]:
+                checked = u["notion"]["checked"]
+            else:
+                checked = False
+            item_dict = {"text": title, "checked": checked}
+            # Preserve UUID from existing Confluence task to avoid regenerating
+            if u["conf"] and u["conf"].get("uuid"):
+                item_dict["uuid"] = u["conf"]["uuid"]
+            items.append(item_dict)
+
+        if not items:
+            return
+
+        new_task_html = ConfluenceClient.build_task_list_html(items)
+        new_body = ConfluenceClient.replace_section(
+            conf_body, self.PLAN_HEADING, new_task_html,
+        )
+        if new_body != conf_body:
+            self.confluence.update_page(
+                conf_page["id"], conf_page["title"], new_body, conf_version,
+            )
+            log.info("%s: updated Confluence plan (%d tasks)", jira_key, len(items))
+
+    # ---- Change detection ----
+
+    @staticmethod
     def _jira_subtasks_changed(
-        self, jira_key: str, subtasks: List[Dict]
+        jira_key: str, subtasks: List[Dict], known_page: Dict,
     ) -> bool:
         """Check if Jira subtask statuses changed since last cycle."""
-        known = self._known.get(jira_key, {}).get("subtask_statuses", {})
-        if not known:
-            return True  # First time — treat as changed
+        known_items = known_page.get("items", {})
+        if not known_items:
+            return bool(subtasks)
         for st in subtasks:
-            if known.get(st["key"]) != st["is_done"]:
+            mk = st["summary"].strip().lower()
+            ki = known_items.get(mk, {})
+            if ki.get("jira_checked") != st["is_done"]:
                 return True
-        # Also check if new subtasks were added
-        if len(subtasks) != len(known):
+        # New subtasks added?
+        known_jira_count = sum(
+            1 for v in known_items.values() if v.get("jira_checked") is not None
+        )
+        if len(subtasks) != known_jira_count:
             return True
         return False
+
+    @staticmethod
+    def _confluence_tasks_changed(
+        jira_key: str, conf_tasks: List[Dict], known_page: Dict,
+    ) -> bool:
+        """Check if Confluence task-list changed since last cycle."""
+        if not conf_tasks:
+            return False
+        known_items = known_page.get("items", {})
+        if not known_items:
+            return True
+        for ct in conf_tasks:
+            mk = ct["text"].strip().lower()
+            ki = known_items.get(mk, {})
+            if ki.get("conf_checked") != ct["checked"]:
+                return True
+        known_conf_count = sum(
+            1 for v in known_items.values() if v.get("conf_checked") is not None
+        )
+        if len(conf_tasks) != known_conf_count:
+            return True
+        return False
+
+    # ---- Known state persistence ----
+
+    def _save_known_state(
+        self,
+        jira_key: str,
+        last_edited: str,
+        conf_when: str,
+        subtasks: List[Dict],
+        todos: List[Dict],
+        conf_tasks: List[Dict],
+    ):
+        """Save resolved state for next cycle's delta detection."""
+        # Build match-key index for each source
+        jira_by_mk = {st["summary"].strip().lower(): st for st in subtasks}
+        todo_by_mk = {t["text"].strip().lower(): t for t in todos}
+        conf_by_mk = {ct["text"].strip().lower(): ct for ct in conf_tasks}
+
+        # Collect all match keys
+        all_keys = set(jira_by_mk) | set(todo_by_mk) | set(conf_by_mk)
+
+        items = {}
+        for mk in all_keys:
+            jira_st = jira_by_mk.get(mk)
+            todo = todo_by_mk.get(mk)
+            conf = conf_by_mk.get(mk)
+            items[mk] = {
+                "notion_checked": todo["checked"] if todo else None,
+                "jira_checked": jira_st["is_done"] if jira_st else None,
+                "conf_checked": conf["checked"] if conf else None,
+                "jira_key": jira_st["key"] if jira_st else None,
+            }
+
+        self._known[jira_key] = {
+            "page_last_edited": last_edited,
+            "conf_version_when": conf_when,
+            "items": items,
+        }
+
+    # ---- Action helpers ----
 
     def _add_plan_section(
         self, page_id: str, jira_key: str, subtasks: List[Dict]
     ):
         """Add plan section to page from existing Jira subtasks."""
         items = [
-            {"title": st["summary"], "checked": st["is_done"]}
+            {
+                "title": st.get("summary", st.get("text", "")),
+                "checked": st.get("is_done", st.get("checked", False)),
+            }
             for st in subtasks
         ]
         if self.dry_run:
@@ -1339,87 +1881,49 @@ class SubtaskTodoSync:
         else:
             self.stats["errors"] += 1
 
-    def _sync_todos_with_subtasks(
-        self,
-        jira_key: str,
-        heading_id: str,
-        todos: List[Dict],
-        subtasks: List[Dict],
-    ):
-        known_todos = self._known.get(jira_key, {}).get("todos", {})
-
-        # Step 1: exact match by title (case-insensitive)
-        subtask_by_title = {}
-        for st in subtasks:
-            subtask_by_title[st["summary"].strip().lower()] = st
-
-        matched_subtask_keys = set()
-        unmatched_todos = []
-
-        for todo in todos:
-            title_lower = todo["text"].strip().lower()
-            st = subtask_by_title.get(title_lower)
-            if st:
-                matched_subtask_keys.add(st["key"])
-                self._sync_pair(jira_key, todo, st, known_todos)
-            else:
-                unmatched_todos.append(todo)
-
-        unmatched_subtasks = [
-            st for st in subtasks if st["key"] not in matched_subtask_keys
-        ]
-
-        # Step 2: pair up unmatched — rename instead of delete+create
-        pairs = min(len(unmatched_todos), len(unmatched_subtasks))
-        for i in range(pairs):
-            self._rename_subtask(
-                jira_key, unmatched_subtasks[i], unmatched_todos[i]
+    def _do_create_subtask(self, jira_key: str, title: str, checked: bool):
+        """Create a Jira subtask from title + checked state."""
+        if self.dry_run:
+            log.info(
+                "[DRY-RUN] Would create subtask '%s' for %s", title, jira_key,
             )
-
-        # Step 3: leftover unmatched todos → create new subtasks
-        for todo in unmatched_todos[pairs:]:
-            self._create_subtask_from_todo(jira_key, todo)
-
-        # Step 4: leftover unmatched subtasks → delete from Jira
-        for st in unmatched_subtasks[pairs:]:
-            self._delete_subtask(jira_key, st)
-
-    def _sync_pair(
-        self,
-        jira_key: str,
-        todo: Dict,
-        subtask: Dict,
-        known_todos: Dict,
-    ):
-        """Sync a matched pair of Notion to-do and Jira subtask."""
-        notion_checked = todo["checked"]
-        jira_done = subtask["is_done"]
-
-        if notion_checked == jira_done:
-            # Already in sync
-            self.stats["todos_synced"] += 1
             return
+        try:
+            created = self.jira.create_subtasks(
+                jira_key, [{"title": title}]
+            )
+            if created:
+                log.info(
+                    "%s: created subtask %s for '%s'",
+                    jira_key, created[0]["key"], title,
+                )
+                self.stats["subtasks_created"] += 1
+                if checked:
+                    self.jira.transition_issue(created[0]["key"], "Готово")
+        except Exception as e:
+            log.warning(
+                "%s: could not create subtask for '%s': %s",
+                jira_key, title, e,
+            )
+            self.stats["errors"] += 1
 
-        known_checked = known_todos.get(todo["text"])
-
-        if known_checked is None:
-            # First time seeing this pair — Notion wins
-            if notion_checked:
-                self._close_subtask(jira_key, subtask)
-            else:
-                self._check_todo(todo, jira_key)
-        elif notion_checked != known_checked:
-            # Notion changed — push to Jira
-            if notion_checked:
-                self._close_subtask(jira_key, subtask)
-            else:
-                self._reopen_subtask(jira_key, subtask)
+    def _do_create_todo(
+        self, heading_id: str, jira_key: str, title: str, checked: bool,
+    ):
+        """Create a Notion to-do from title + checked state."""
+        if self.dry_run:
+            log.info(
+                "[DRY-RUN] Would create to-do '%s' for %s", title, jira_key,
+            )
+            return
+        block_id = self.notion.create_todo_block(
+            heading_id, title, checked=checked,
+        )
+        if block_id:
+            log.info("%s: created to-do '%s'", jira_key, title)
+            self.stats["todos_created"] += 1
         else:
-            # Jira changed — push to Notion
-            if jira_done:
-                self._check_todo(todo, jira_key)
-            else:
-                self._uncheck_todo(todo, jira_key)
+            self.stats["errors"] += 1
 
     def _close_subtask(self, jira_key: str, subtask: Dict):
         if self.dry_run:
@@ -1458,7 +1962,7 @@ class SubtaskTodoSync:
     def _check_todo(self, todo: Dict, jira_key: str):
         if self.dry_run:
             log.info(
-                "[DRY-RUN] Would check '%s' for %s", todo["text"], jira_key
+                "[DRY-RUN] Would check '%s' for %s", todo["text"], jira_key,
             )
             return
         if self.notion.update_todo_checked(todo["id"], True):
@@ -1470,108 +1974,12 @@ class SubtaskTodoSync:
     def _uncheck_todo(self, todo: Dict, jira_key: str):
         if self.dry_run:
             log.info(
-                "[DRY-RUN] Would uncheck '%s' for %s", todo["text"], jira_key
+                "[DRY-RUN] Would uncheck '%s' for %s", todo["text"], jira_key,
             )
             return
         if self.notion.update_todo_checked(todo["id"], False):
             log.info("%s: unchecked '%s'", jira_key, todo["text"])
             self.stats["checked_updated"] += 1
-        else:
-            self.stats["errors"] += 1
-
-    def _rename_subtask(self, jira_key: str, subtask: Dict, todo: Dict):
-        """Rename Jira subtask to match changed Notion to-do text."""
-        new_title = todo["text"].strip()
-        if self.dry_run:
-            log.info(
-                "[DRY-RUN] %s: would rename %s '%s' → '%s'",
-                jira_key, subtask["key"], subtask["summary"], new_title,
-            )
-            return
-        ok = self.jira.rename_issue(subtask["key"], new_title)
-        if ok:
-            log.info(
-                "%s: renamed %s '%s' → '%s'",
-                jira_key, subtask["key"], subtask["summary"], new_title,
-            )
-            self.stats["checked_updated"] += 1
-            # Sync checked status too
-            if todo["checked"] and not subtask["is_done"]:
-                self._close_subtask(jira_key, subtask)
-            elif not todo["checked"] and subtask["is_done"]:
-                self._reopen_subtask(jira_key, subtask)
-        else:
-            log.warning(
-                "%s: could not rename %s", jira_key, subtask["key"]
-            )
-            self.stats["errors"] += 1
-
-    def _delete_subtask(self, jira_key: str, subtask: Dict):
-        """Delete a Jira subtask that was removed from Notion."""
-        if self.dry_run:
-            log.info(
-                "[DRY-RUN] %s: would delete %s '%s'",
-                jira_key, subtask["key"], subtask["summary"],
-            )
-            return
-        ok = self.jira.delete_issue(subtask["key"])
-        if ok:
-            log.info(
-                "%s: deleted subtask %s '%s'",
-                jira_key, subtask["key"], subtask["summary"],
-            )
-            self.stats["subtasks_deleted"] += 1
-        else:
-            log.warning(
-                "%s: could not delete %s", jira_key, subtask["key"]
-            )
-            self.stats["errors"] += 1
-
-    def _create_subtask_from_todo(self, jira_key: str, todo: Dict):
-        if self.dry_run:
-            log.info(
-                "[DRY-RUN] Would create subtask '%s' for %s",
-                todo["text"], jira_key,
-            )
-            return
-        try:
-            created = self.jira.create_subtasks(
-                jira_key, [{"title": todo["text"]}]
-            )
-            if created:
-                log.info(
-                    "%s: created subtask %s for '%s'",
-                    jira_key, created[0]["key"], todo["text"],
-                )
-                self.stats["subtasks_created"] += 1
-                # If todo is already checked, close the new subtask
-                if todo["checked"]:
-                    self.jira.transition_issue(created[0]["key"], "Готово")
-        except Exception as e:
-            log.warning(
-                "%s: could not create subtask for '%s': %s",
-                jira_key, todo["text"], e,
-            )
-            self.stats["errors"] += 1
-
-    def _create_todo_from_subtask(
-        self, heading_id: str, jira_key: str, subtask: Dict
-    ):
-        if self.dry_run:
-            log.info(
-                "[DRY-RUN] Would create to-do '%s' for %s",
-                subtask["summary"], jira_key,
-            )
-            return
-        block_id = self.notion.create_todo_block(
-            heading_id, subtask["summary"], checked=subtask["is_done"]
-        )
-        if block_id:
-            log.info(
-                "%s: created to-do '%s' (from %s)",
-                jira_key, subtask["summary"], subtask["key"],
-            )
-            self.stats["todos_created"] += 1
         else:
             self.stats["errors"] += 1
 
@@ -1583,10 +1991,10 @@ class SubtaskTodoSync:
         s = self.stats
         log.info(
             "Subtask↔Todo: pages=%d, synced=%d, "
-            "subtasks_created=%d, subtasks_deleted=%d, "
-            "todos_created=%d, checked_updated=%d, errors=%d",
+            "subtasks_created=%d, todos_created=%d, "
+            "checked_updated=%d, errors=%d",
             s["pages_checked"], s["todos_synced"],
-            s["subtasks_created"], s["subtasks_deleted"],
+            s["subtasks_created"],
             s["todos_created"], s["checked_updated"], s["errors"],
         )
 
@@ -1677,21 +2085,17 @@ class ConfluenceSync:
             if self.dry_run:
                 log.info("[DRY-RUN] Would set up links for %s", jira_key)
             else:
-                # Update Confluence page with our template (links + structure)
+                # Add links section to Confluence page if missing.
+                # IMPORTANT: only prepend the links block — never replace
+                # the entire body, as user content must be preserved.
                 full = self.confluence.get_page(conf_page["id"])
                 if full:
                     body = full["body"]["storage"]["value"]
-                    # Only update if page doesn't have our links section
                     if "Ссылки" not in body:
-                        summary = NotionClient.get_page_summary(page) or ""
-                        subtasks = self.jira.get_subtask_details(jira_key)
-                        new_body = self.confluence.build_task_page_html(
-                            jira_key=jira_key,
-                            jira_url=jira_url,
-                            notion_url=notion_url,
-                            summary=summary,
-                            subtasks=subtasks if subtasks else None,
+                        links_html = self._build_links_section(
+                            jira_key, jira_url, notion_url,
                         )
+                        new_body = links_html + "\n" + body
                         version = full["version"]["number"]
                         self.confluence.update_page(
                             conf_page["id"], conf_page["title"], new_body, version
@@ -1735,6 +2139,22 @@ class ConfluenceSync:
                         return
             self.stats["skipped"] += 1
 
+    @staticmethod
+    def _build_links_section(
+        jira_key: str, jira_url: str, notion_url: str,
+    ) -> str:
+        """Build only the links section XHTML — no full template."""
+        parts = ['<h2>Ссылки</h2>']
+        links = []
+        if jira_url:
+            links.append(f'<a href="{jira_url}">{jira_key} (Jira)</a>')
+        if notion_url:
+            links.append(f'<a href="{notion_url}">Notion</a>')
+        if links:
+            parts.append(f'<p>{" | ".join(links)}</p>')
+        parts.append("<hr/>")
+        return "\n".join(parts)
+
     def _save(self):
         self._state["confluence_linked_keys"] = list(self._linked_keys)
         _save_state(self._state)
@@ -1758,9 +2178,10 @@ class SectionSync:
     """
 
     SYNCED_SECTIONS = [
+        "Описание задачи",
         "Минимальный функционал (MVP)",
-        "Результат",
         "Заметки / Лог",
+        "Результат",
     ]
 
     def __init__(
@@ -1874,7 +2295,11 @@ class SectionSync:
                 # Confluence → Notion
                 new_blocks = self._to_blocks(conf_content or "")
                 self.notion.replace_toggle_content(page_id, section, new_blocks)
-                notion_hash = conf_hash
+                # Flip-flop guard: save hash of what Notion will produce on
+                # next read, not the original Confluence hash. This prevents
+                # converter non-idempotency from triggering false changes.
+                roundtrip_xhtml = self._to_xhtml(new_blocks)
+                notion_hash = self._compute_hash(roundtrip_xhtml)
                 self.stats["conf_to_notion"] += 1
                 log.info("%s: %s → Notion", jira_key, section)
 
@@ -1898,7 +2323,9 @@ class SectionSync:
                     self.notion.replace_toggle_content(
                         page_id, section, new_blocks,
                     )
-                    notion_hash = conf_hash
+                    # Flip-flop guard: save roundtrip hash for Notion
+                    roundtrip_xhtml = self._to_xhtml(new_blocks)
+                    notion_hash = self._compute_hash(roundtrip_xhtml)
                     log.info(
                         "%s: %s CONFLICT → Confluence wins (edited %s vs %s)",
                         jira_key, section, conf_when, notion_edited,

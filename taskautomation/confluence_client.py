@@ -114,16 +114,12 @@ class ConfluenceClient:
         """Find existing page by Jira key or create new one.
 
         Jira Automation may already create pages — this avoids duplicates.
-        If found, updates body with our template.
+        If found, returns as-is WITHOUT overwriting user content.
         """
         existing = self.find_page_by_jira_key(jira_key)
         if existing:
-            log.info("Found existing Confluence page for %s (id=%s)", jira_key, existing.get("id"))
-            # Update with our template
-            full = self.get_page(existing["id"])
-            if full:
-                version = full["version"]["number"]
-                self.update_page(existing["id"], existing["title"], body_html, version)
+            log.info("Found existing Confluence page for %s (id=%s) — returning as-is",
+                     jira_key, existing.get("id"))
             return existing
 
         # Try to create
@@ -134,11 +130,7 @@ class ConfluenceClient:
         # If creation failed (title conflict from Jira Automation race), try find again
         existing = self.find_page_by_jira_key(jira_key)
         if existing:
-            log.info("Found page after create conflict for %s", jira_key)
-            full = self.get_page(existing["id"])
-            if full:
-                version = full["version"]["number"]
-                self.update_page(existing["id"], existing["title"], body_html, version)
+            log.info("Found page after create conflict for %s — returning as-is", jira_key)
             return existing
 
         return None
@@ -304,7 +296,7 @@ class ConfluenceClient:
 
     # Regex: match <h2>heading</h2> + everything until next <h2> or end
     _SECTION_RE = re.compile(
-        r'(<h2>(?P<title>[^<]+)</h2>)(?P<content>.*?)(?=<h2>|\Z)',
+        r'(<h2[^>]*>(?P<title>[^<]+)</h2>)(?P<content>.*?)(?=<h2[\s>]|\Z)',
         re.DOTALL,
     )
 
@@ -346,6 +338,54 @@ class ConfluenceClient:
             return resp.json()
         log.error("Failed to get page %s: %s", page_id, resp.status_code)
         return None
+
+    @staticmethod
+    def parse_task_list(html: str) -> List[Dict[str, Any]]:
+        """Parse ac:task-list XHTML into list of dicts.
+
+        Returns: [{"text": "...", "checked": bool, "task_id": "...", "uuid": "..."}]
+        """
+        tasks = []
+        for m in re.finditer(
+            r'<ac:task>.*?<ac:task-id>(\d+)</ac:task-id>.*?'
+            r'<ac:task-uuid>([\w-]+)</ac:task-uuid>.*?'
+            r'<ac:task-status>(complete|incomplete)</ac:task-status>.*?'
+            r'<ac:task-body>.*?>(.*?)</span>.*?</ac:task-body>.*?</ac:task>',
+            html, re.DOTALL,
+        ):
+            text = m.group(4).strip()
+            # Unescape basic HTML entities
+            text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"')
+            tasks.append({
+                "text": text,
+                "checked": m.group(3) == "complete",
+                "task_id": m.group(1),
+                "uuid": m.group(2),
+            })
+        return tasks
+
+    @staticmethod
+    def build_task_list_html(items: List[Dict[str, Any]]) -> str:
+        """Build ac:task-list XHTML from list of dicts.
+
+        Input: [{"text": "...", "checked": bool}]
+        """
+        import uuid as _uuid
+        parts = ['<ac:task-list>']
+        for i, item in enumerate(items, start=1):
+            status = "complete" if item.get("checked") else "incomplete"
+            uid = item.get("uuid", str(_uuid.uuid4())[:12])
+            text = ConfluenceClient._escape_html(item["text"])
+            parts.append(
+                f'<ac:task>'
+                f'<ac:task-id>{i}</ac:task-id>'
+                f'<ac:task-uuid>{uid}</ac:task-uuid>'
+                f'<ac:task-status>{status}</ac:task-status>'
+                f'<ac:task-body><span class="placeholder-inline-tasks">{text}</span></ac:task-body>'
+                f'</ac:task>'
+            )
+        parts.append('</ac:task-list>')
+        return '\n'.join(parts)
 
     @staticmethod
     def _escape_html(text: str) -> str:

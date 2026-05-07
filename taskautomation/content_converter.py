@@ -301,6 +301,8 @@ class _XHTMLToNotionParser(HTMLParser):
         elif ltag == "p":
             if self._in_cell:
                 pass  # handled at cell end
+            elif "blockquote" in self._stack:
+                pass  # handled at blockquote end
             elif self._rt:
                 self.blocks.append(_make_paragraph(self._rt))
                 self._rt = []
@@ -408,6 +410,15 @@ class _XHTMLToNotionParser(HTMLParser):
         if self._link_url:
             rt_item["text"]["link"] = {"url": self._link_url}
         self._rt.append(rt_item)
+
+    def unknown_decl(self, data: str):
+        """Handle CDATA sections: <![CDATA[content]]>."""
+        if data.startswith("CDATA["):
+            content = data[6:]  # Strip "CDATA[" prefix
+            if content.endswith("]"):
+                content = content[:-1]  # Strip trailing "]"
+            if self._in_code_macro and "ac:plain-text-body" in self._stack:
+                self._code_body += content
 
 
 def xhtml_to_notion_blocks(xhtml: str) -> List[Dict[str, Any]]:

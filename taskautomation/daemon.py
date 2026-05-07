@@ -152,9 +152,10 @@ class SyncDaemon:
             jira=jira, notion=notion, dry_run=self.dry_run
         ).run()
 
-        # Phase 5: Sync to-do checkboxes ↔ Jira subtasks
+        # Phase 5: Sync to-do checkboxes ↔ Jira subtasks ↔ Confluence tasks
         SubtaskTodoSync(
-            jira=jira, notion=notion, dry_run=self.dry_run
+            jira=jira, notion=notion, confluence=confluence,
+            dry_run=self.dry_run,
         ).run()
 
         # Phase 6: Confluence sync (create pages, update progress)
