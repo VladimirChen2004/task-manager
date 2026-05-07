@@ -21,6 +21,7 @@ from dateutil.parser import isoparse
 from .confluence_client import ConfluenceClient
 from .jira_client import JiraVCHEN
 from .notion_client import NotionClient
+from .orphan_keys import OrphanResolver
 
 log = logging.getLogger("taskautomation.sync")
 
@@ -1234,10 +1235,11 @@ class SubtaskTodoSync:
             "pages_checked": 0, "todos_synced": 0,
             "subtasks_created": 0, "subtasks_deleted": 0,
             "todos_created": 0,
-            "checked_updated": 0, "errors": 0,
+            "checked_updated": 0, "skipped_orphan": 0, "errors": 0,
         }
         self._state = _load_state()
         self._known = self._state.get("subtask_todos", {})
+        self._orphans = OrphanResolver(STATE_FILE)
 
     def run(self):
         log.info("Subtask↔Todo sync: starting (three-way)")
@@ -1249,6 +1251,14 @@ class SubtaskTodoSync:
             if not jira_key:
                 continue
             self.stats["pages_checked"] += 1
+
+            # Skip orphaned keys before any Jira fetch — avoids the
+            # 404 → exception → ERROR-log cycle. Notion / Confluence
+            # are left untouched; status reconciliation is up to the
+            # operator (see tests/manual/diagnose_orphan_jira_key.py).
+            if self._orphans.probe_and_resolve(jira_key, self.jira):
+                self.stats["skipped_orphan"] += 1
+                continue
 
             try:
                 self._sync_page(page, jira_key)
@@ -2058,10 +2068,11 @@ class SubtaskTodoSync:
         log.info(
             "Subtask↔Todo: pages=%d, synced=%d, "
             "subtasks_created=%d, todos_created=%d, "
-            "checked_updated=%d, errors=%d",
+            "checked_updated=%d, skipped_orphan=%d, errors=%d",
             s["pages_checked"], s["todos_synced"],
             s["subtasks_created"],
-            s["todos_created"], s["checked_updated"], s["errors"],
+            s["todos_created"], s["checked_updated"],
+            s.get("skipped_orphan", 0), s["errors"],
         )
 
 
@@ -2082,9 +2093,11 @@ class ConfluenceSync:
         self.notion = notion
         self.confluence = confluence
         self.dry_run = dry_run
-        self.stats = {"checked": 0, "created": 0, "updated": 0, "linked": 0, "skipped": 0, "errors": 0}
+        self.stats = {"checked": 0, "created": 0, "updated": 0, "linked": 0,
+                      "skipped": 0, "skipped_orphan": 0, "errors": 0}
         self._state = _load_state()
         self._linked_keys = set(self._state.get("confluence_linked_keys", []))
+        self._orphans = OrphanResolver(STATE_FILE)
 
     def run(self):
         log.info("Confluence sync: starting")
@@ -2096,6 +2109,15 @@ class ConfluenceSync:
             if not jira_key:
                 continue
             self.stats["checked"] += 1
+
+            # Skip orphaned keys (Jira issue gone) — probe once per key
+            # per phase, mark/clear tombstone, then read tombstone state.
+            # WARN, not ERROR: this is a known reconciliation gap, not
+            # a sync failure. Notion / Confluence are left untouched.
+            if self._orphans.probe_and_resolve(jira_key, self.jira):
+                self.stats["skipped_orphan"] += 1
+                continue
+
             try:
                 self._sync_page(page, jira_key)
             except Exception as e:
@@ -2228,8 +2250,10 @@ class ConfluenceSync:
     def _log_stats(self):
         s = self.stats
         log.info(
-            "Confluence: checked=%d, created=%d, linked=%d, updated=%d, skipped=%d, errors=%d",
-            s["checked"], s["created"], s["linked"], s["updated"], s["skipped"], s["errors"],
+            "Confluence: checked=%d, created=%d, linked=%d, updated=%d, "
+            "skipped=%d, skipped_orphan=%d, errors=%d",
+            s["checked"], s["created"], s["linked"], s["updated"],
+            s["skipped"], s.get("skipped_orphan", 0), s["errors"],
         )
 
 

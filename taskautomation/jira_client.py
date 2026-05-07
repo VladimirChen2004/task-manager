@@ -413,6 +413,37 @@ class JiraVCHEN:
         result["progress"] = self._raw_subtask_progress(raw)
         return result
 
+    def issue_exists(self, issue_key: str) -> Optional[bool]:
+        """Probe whether a Jira issue exists, distinguishing 404 from
+        transient failures. Returns:
+
+          * True  — 200 OK; issue exists.
+          * False — 404 Not Found; issue truly does not exist (deleted,
+                    moved to another project with a different key, or
+                    never existed).
+          * None  — anything else (5xx, 403, network error, parser blew
+                    up). Caller MUST NOT treat this as "deleted".
+
+        Used by ``OrphanResolver.probe_and_resolve`` to decide whether
+        to mark / clear / leave a tombstone.
+        """
+        import logging
+        url = f"{self.server}/rest/api/3/issue/{issue_key}"
+        try:
+            resp = self._request("get", url)
+        except Exception as e:
+            logging.getLogger("taskautomation.jira").warning(
+                "issue_exists(%s) probe failed: %s — returning None",
+                issue_key, type(e).__name__,
+            )
+            return None
+        if resp.status_code == 200:
+            return True
+        if resp.status_code == 404:
+            return False
+        # 401, 403, 5xx, anything else — don't conclude deletion.
+        return None
+
     def get_all_issues(self, max_results: int = 200) -> List[Dict[str, Any]]:
         """Get ALL issues in project (including Done)."""
         jql = f'project = {self.PROJECT} ORDER BY created DESC'
