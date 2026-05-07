@@ -363,6 +363,43 @@ class TestConfluenceSyncIntegration:
         on_disk = json.loads(sf.read_text())
         assert "VC-114" in on_disk.get("orphaned_jira_keys", {})
 
+    def test_save_does_not_clobber_orphan_bucket(self, tmp_path):
+        """Regression: phase _save() must not overwrite the
+        orphaned_jira_keys bucket that OrphanResolver wrote during
+        the cycle. Previously SubtaskTodoSync._save and
+        ConfluenceSync._save did `_save_state(self._state)` with a
+        stale in-memory state, erasing tombstones added mid-cycle.
+        Fix is read-modify-write in _save.
+        """
+        from taskautomation.orphan_keys import OrphanResolver
+        cs, sf = self._make_sync(tmp_path)
+
+        cs.notion.query_all_pages_with_jira_key.return_value = [{
+            "id": "p1",
+            "properties": {
+                "Jira Key": {
+                    "rich_text": [{
+                        "type": "text",
+                        "text": {"content": "VC-114"},
+                        "plain_text": "VC-114",
+                    }],
+                },
+            },
+        }]
+        cs.jira.issue_exists.return_value = False  # 404
+
+        import taskautomation.sync as sync_module
+        sync_module.time.sleep = lambda *a, **kw: None
+
+        cs.run()
+
+        # Tombstone must SURVIVE the phase's _save() call.
+        on_disk = json.loads(sf.read_text())
+        assert "VC-114" in on_disk.get("orphaned_jira_keys", {}), (
+            "phase _save() clobbered orphaned_jira_keys bucket — "
+            "use read-modify-write in _save."
+        )
+
     def test_restored_jira_clears_tombstone_and_runs_sync(self, tmp_path):
         """If Jira now returns 200 for a previously-orphaned key, the
         tombstone is cleared and normal sync proceeds."""

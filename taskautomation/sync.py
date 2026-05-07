@@ -2060,8 +2060,13 @@ class SubtaskTodoSync:
             self.stats["errors"] += 1
 
     def _save(self):
-        self._state["subtask_todos"] = self._known
-        _save_state(self._state)
+        # Read-modify-write so we don't clobber buckets that other
+        # components (OrphanResolver, other phases) wrote during this
+        # cycle. The previous version wrote self._state wholesale,
+        # erasing tombstones added mid-cycle by orphan_keys.
+        state = _load_state()
+        state["subtask_todos"] = self._known
+        _save_state(state)
 
     def _log_stats(self):
         s = self.stats
@@ -2244,8 +2249,12 @@ class ConfluenceSync:
         return "\n".join(parts)
 
     def _save(self):
-        self._state["confluence_linked_keys"] = list(self._linked_keys)
-        _save_state(self._state)
+        # Read-modify-write so we don't clobber buckets that other
+        # components (OrphanResolver, other phases) wrote during this
+        # cycle.
+        state = _load_state()
+        state["confluence_linked_keys"] = list(self._linked_keys)
+        _save_state(state)
 
     def _log_stats(self):
         s = self.stats
@@ -2437,8 +2446,12 @@ class SectionSync:
         self._section_state[jira_key] = task_state
 
     def _save(self):
-        self._state["section_sync"] = self._section_state
-        _save_state(self._state)
+        # Read-modify-write so we don't clobber buckets that other
+        # components (OrphanResolver, other phases) wrote during this
+        # cycle.
+        state = _load_state()
+        state["section_sync"] = self._section_state
+        _save_state(state)
 
     def _log_stats(self):
         s = self.stats
