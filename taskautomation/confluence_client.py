@@ -416,30 +416,83 @@ class ConfluenceClient:
         log.error("Failed to get page %s: %s", page_id, resp.status_code)
         return None
 
-    @staticmethod
-    def parse_task_list(html: str) -> List[Dict[str, Any]]:
+    # Regex for splitting the task-list into <ac:task>...</ac:task>
+    # blocks. The body parsers below handle order/whitespace/optional
+    # uuid/optional span wrapper.
+    _TASK_BLOCK_RE = re.compile(r'<ac:task>(.*?)</ac:task>', re.DOTALL)
+    _TASK_ID_RE = re.compile(r'<ac:task-id>\s*([^<]+?)\s*</ac:task-id>', re.DOTALL)
+    _TASK_UUID_RE = re.compile(r'<ac:task-uuid>\s*([^<]+?)\s*</ac:task-uuid>', re.DOTALL)
+    _TASK_STATUS_RE = re.compile(
+        r'<ac:task-status>\s*(complete|incomplete)\s*</ac:task-status>',
+        re.DOTALL,
+    )
+    _TASK_BODY_RE = re.compile(r'<ac:task-body>(.*?)</ac:task-body>', re.DOTALL)
+    _ANY_TAG_RE = re.compile(r'<[^>]+>')
+
+    @classmethod
+    def parse_task_list(cls, html: str) -> List[Dict[str, Any]]:
         """Parse ac:task-list XHTML into list of dicts.
 
         Returns: [{"text": "...", "checked": bool, "task_id": "...", "uuid": "..."}]
+
+        The parser tolerates real-world Confluence storage variants:
+          - any order of <ac:task-id> / <ac:task-uuid> / <ac:task-status>
+            / <ac:task-body> children inside <ac:task>;
+          - whitespace / newlines between child elements;
+          - missing <ac:task-uuid> on legacy pages (uuid → "");
+          - bodies with or without the
+            <span class="placeholder-inline-tasks"> wrapper;
+          - rich inline content inside the body (<strong>, <a>, etc.) —
+            tags are stripped to plain text, entities are decoded.
+
+        Tasks missing <ac:task-id> or <ac:task-status> are skipped:
+        without those two we can't address the task back to Confluence.
         """
-        tasks = []
-        for m in re.finditer(
-            r'<ac:task>.*?<ac:task-id>(\d+)</ac:task-id>.*?'
-            r'<ac:task-uuid>([\w-]+)</ac:task-uuid>.*?'
-            r'<ac:task-status>(complete|incomplete)</ac:task-status>.*?'
-            r'<ac:task-body>.*?>(.*?)</span>.*?</ac:task-body>.*?</ac:task>',
-            html, re.DOTALL,
-        ):
-            text = m.group(4).strip()
-            # Unescape basic HTML entities
-            text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"')
+        tasks: List[Dict[str, Any]] = []
+        for block_match in cls._TASK_BLOCK_RE.finditer(html or ""):
+            block = block_match.group(1)
+
+            id_m = cls._TASK_ID_RE.search(block)
+            status_m = cls._TASK_STATUS_RE.search(block)
+            if not id_m or not status_m:
+                continue
+
+            uuid_m = cls._TASK_UUID_RE.search(block)
+            body_m = cls._TASK_BODY_RE.search(block)
+
+            text = ""
+            if body_m:
+                text = cls._extract_body_text(body_m.group(1))
+
             tasks.append({
                 "text": text,
-                "checked": m.group(3) == "complete",
-                "task_id": m.group(1),
-                "uuid": m.group(2),
+                "checked": status_m.group(1) == "complete",
+                "task_id": id_m.group(1).strip(),
+                "uuid": uuid_m.group(1).strip() if uuid_m else "",
             })
         return tasks
+
+    @classmethod
+    def _extract_body_text(cls, body_inner: str) -> str:
+        """Reduce <ac:task-body> inner content to plain text.
+
+        - Strip all tags (works for both bare bodies and bodies wrapped
+          in <span class="placeholder-inline-tasks"> or rich inline
+          content like <strong>, <a>, <ac:link>).
+        - Collapse internal whitespace runs to single spaces.
+        - Decode common HTML entities.
+        """
+        text = cls._ANY_TAG_RE.sub("", body_inner)
+        text = (text
+                .replace("&amp;", "&")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&quot;", '"')
+                .replace("&apos;", "'")
+                .replace("&#39;", "'"))
+        # Collapse any whitespace run to a single space, strip ends.
+        text = " ".join(text.split())
+        return text
 
     @staticmethod
     def build_task_list_html(items: List[Dict[str, Any]]) -> str:

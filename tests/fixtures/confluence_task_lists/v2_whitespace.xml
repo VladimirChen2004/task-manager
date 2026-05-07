@@ -1,0 +1,18 @@
+<ac:task-list>
+  <ac:task>
+    <ac:task-id>1</ac:task-id>
+    <ac:task-uuid>ws-001</ac:task-uuid>
+    <ac:task-status>incomplete</ac:task-status>
+    <ac:task-body>
+      <span class="placeholder-inline-tasks">First item with newlines</span>
+    </ac:task-body>
+  </ac:task>
+  <ac:task>
+    <ac:task-id>2</ac:task-id>
+    <ac:task-uuid>ws-002</ac:task-uuid>
+    <ac:task-status>complete</ac:task-status>
+    <ac:task-body>
+      <span class="placeholder-inline-tasks">Second item</span>
+    </ac:task-body>
+  </ac:task>
+</ac:task-list>
