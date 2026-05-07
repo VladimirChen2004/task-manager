@@ -13,3 +13,12 @@ venv/
 migrate_kanban.py
 migration_mapping.json
 claude-logs/
+
+# Root-level launcher (lives in $HOME on prod, not in repo).
+/run_daemon.sh
+
+# Stray rsync byproduct: top-level copies of files that belong inside
+# packages. Real sources live in taskautomation/ and tests/.
+/sync.py
+/orphan_keys.py
+/test_orphan_keys.py

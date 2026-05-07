@@ -63,7 +63,7 @@ taskautomation/               # Python-пакет
 jira_vchen.py                  # shim → taskautomation.cli.main_jira()
 jira_notion_sync.py            # shim → taskautomation.cli.main_sync()
 sync_daemon.py                 # shim → taskautomation.cli.main_daemon()
-cleanup_and_recreate.py        # миграционный скрипт (удаление + пересоздание)
+archive/                       # одноразовые миграционные/fix-скрипты (см. archive/README.md)
 deploy/                        # deploy.sh, sync_wrapper.sh, crontab.example
 Makefile                       # make daemon, make sync, make deploy, make test
 ```
