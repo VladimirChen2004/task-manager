@@ -519,6 +519,49 @@ class NotionClient:
                 )
         return children
 
+    @staticmethod
+    def _block_tree_fingerprint(blocks: List[Dict[str, Any]]) -> str:
+        """Structural fingerprint of a list of Notion blocks.
+
+        Walks the full tree (block + ``_children`` recursively) so that
+        differences buried in nested grandchildren are reflected in the
+        hash. Independent of the XHTML converter — needed because the
+        converter doesn't serialise ``_children`` for every block type
+        (e.g. ``paragraph`` ignores them), which would let the guard
+        either falsely match or falsely diverge.
+
+        The fingerprint is stable for semantically identical content:
+        type + checked-state + plain text + nested fingerprint, joined
+        in order, hashed with sha256.
+        """
+        import hashlib
+
+        def _normalise(rt_list):
+            # Concatenate plain_text or text.content; ignore ids/timestamps.
+            parts = []
+            for rt in rt_list or []:
+                txt = rt.get("plain_text")
+                if txt is None:
+                    txt = rt.get("text", {}).get("content", "")
+                parts.append(txt)
+            return "".join(parts)
+
+        def _walk(block_list):
+            sig_parts = []
+            for b in block_list or []:
+                btype = b.get("type", "")
+                bdata = b.get(btype, {}) if btype else {}
+                text = _normalise(bdata.get("rich_text", []))
+                checked = bdata.get("checked", "")
+                children_sig = ""
+                if b.get("has_children") and b.get("_children"):
+                    children_sig = _walk(b["_children"])
+                sig_parts.append(f"{btype}|{checked}|{text}|[{children_sig}]")
+            return "\x1f".join(sig_parts)
+
+        digest = hashlib.sha256(_walk(blocks).encode("utf-8")).hexdigest()
+        return digest[:16]
+
     def replace_toggle_content(
         self, page_id: str, heading_text: str,
         new_children: List[Dict[str, Any]],
@@ -526,30 +569,49 @@ class NotionClient:
         """Replace all children of a toggle heading with new blocks.
 
         1. Finds toggle by heading_text
-        2. Converts both existing and new blocks to XHTML and compares
-           hashes — skips if unchanged (idempotency guard)
+        2. Builds a structural fingerprint of existing (with nested
+           grandchildren fetched) and new blocks; skips the write if
+           they match (idempotency guard)
         3. Deletes all existing children
         4. Appends new_children
+
+        The fingerprint walks ``_children`` recursively so that real
+        differences in nested content trigger a rebuild, and equivalent
+        content with the same nesting is correctly skipped — even for
+        block types whose XHTML converter ignores nested children.
         """
         toggle_id = self.find_toggle_by_text(page_id, heading_text)
         if not toggle_id:
             log.warning("Toggle '%s' not found on page %s", heading_text, page_id)
             return False
 
-        # Read existing children
+        # Read existing children with nested grandchildren attached so
+        # the fingerprint sees the same shape as new_children may have.
         existing = self.get_block_children(toggle_id)
+        for child in existing:
+            if child.get("has_children"):
+                try:
+                    child["_children"] = self._fetch_children_recursive(
+                        child["id"]
+                    )
+                except Exception as e:
+                    # Don't fail the whole operation; just skip the guard.
+                    log.debug(
+                        "Failed to fetch nested children for %s: %s",
+                        child.get("id"), e,
+                    )
 
-        # Idempotency guard: convert both to XHTML and compare hashes.
-        # This uses the same converter as SectionSync, catching all
-        # content types (links, annotations, code, tables, etc.)
+        # Idempotency guard: compare structural fingerprints. We use a
+        # tree-walking fingerprint (not the XHTML converter) because the
+        # converter ignores nested children for some block types and
+        # would yield false matches/diverges for nested content.
         try:
-            from .content_converter import compute_content_hash, notion_blocks_to_xhtml
-            existing_hash = compute_content_hash(notion_blocks_to_xhtml(existing))
-            new_hash = compute_content_hash(notion_blocks_to_xhtml(new_children))
-            if existing_hash == new_hash:
+            existing_fp = self._block_tree_fingerprint(existing)
+            new_fp = self._block_tree_fingerprint(new_children)
+            if existing_fp == new_fp:
                 log.debug(
-                    "Toggle '%s' content unchanged (hash=%s), skipping write",
-                    heading_text, existing_hash,
+                    "Toggle '%s' content unchanged (fp=%s), skipping write",
+                    heading_text, existing_fp,
                 )
                 return True
         except Exception as e:
